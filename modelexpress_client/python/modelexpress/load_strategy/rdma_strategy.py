@@ -486,6 +486,7 @@ class RdmaStrategy(LoadStrategy):
         # phase duration can be read against the policy that picked the peer.
         policy = configured_policy_label()
         try:
+            result.skip_allocate = True
             with selection_metrics.time_source_attempt_phase(policy, "prepare"):
                 result = ctx.adapter.prepare_rdma_target(result)
                 result = ctx.adapter.before_rdma_receive(result)

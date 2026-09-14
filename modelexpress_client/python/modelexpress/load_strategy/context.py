@@ -44,6 +44,10 @@ class LoadResult(Generic[T]):
     model: nn.Module | None = None
     publishable: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Set by RdmaStrategy before prepare_rdma_target(): the RDMA receive path
+    # fills tensors via NIXL, so the adapter must skip its own dummy-load
+    # allocation instead of overwriting them.
+    skip_allocate: bool = False
 
     @property
     def model_for_publish(self) -> nn.Module | None:
