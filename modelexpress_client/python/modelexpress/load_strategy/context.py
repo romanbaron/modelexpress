@@ -92,3 +92,5 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+    skip_post_process: bool = False
+    skip_allocate: bool = False
