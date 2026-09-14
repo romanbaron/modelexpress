@@ -15,6 +15,7 @@ import torch.nn as nn
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
+from modelexpress.load_strategy import _run_strategy_attempt
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.nixl_transfer import NixlTransferManager
 
@@ -1308,18 +1309,19 @@ class TestLoadStrategyChainRunErrorHandling:
 
 
 class TestDefaultStrategy:
-    @patch("modelexpress.load_strategy.default_strategy.register_tensors")
-    def test_after_native_load_failure_is_mutated(self, mock_register):
+    def test_after_native_load_failure_is_mutated(self):
         from modelexpress.load_strategy.default_strategy import DefaultStrategy
 
         ctx = _make_load_context()
         ctx.adapter.after_native_load = MagicMock(side_effect=RuntimeError("post load"))
 
+        model = MagicMock()
         with pytest.raises(StrategyFailed, match="post load") as exc:
-            DefaultStrategy().load(MagicMock(), ctx)
+            _run_strategy_attempt(
+                DefaultStrategy(), LoadResult(value=model, model=model), ctx
+            )
 
         assert exc.value.mutated is True
-        mock_register.assert_not_called()
 
 
 class TestRdmaStrategyAvailability:
@@ -1624,13 +1626,18 @@ class TestRdmaStrategyLoad:
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
+    def test_prepare_phase_failure_is_mutated(self):
+        """prepare() dummy-allocates and reshapes, so a failure leaves a dirty model.
+
+        The phase runs from the chain now, which is therefore where the
+        conversion into a mutated StrategyFailed has to happen.
+        """
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
         ctx = _make_load_context()
+        ctx.is_reload = False
         result = LoadResult(value=MagicMock(), model=MagicMock())
         strategy = RdmaStrategy()
-        source_worker = _make_worker()
 
         ctx.adapter.prepare_rdma_target = MagicMock(side_effect=lambda result: result)
         ctx.adapter.before_rdma_receive = MagicMock(
@@ -1638,7 +1645,7 @@ class TestRdmaStrategyLoad:
         )
 
         with pytest.raises(StrategyFailed, match="post-prepare failure") as exc:
-            strategy._load_as_target(result, ctx, source_worker, "src", "worker")
+            _run_strategy_attempt(strategy, result, ctx)
 
         assert exc.value.mutated is True
 

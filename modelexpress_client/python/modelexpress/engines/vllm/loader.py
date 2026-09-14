@@ -106,6 +106,40 @@ class MxModelLoader(BaseModelLoader):
         a model subtree. ModelExpress does not interpret it; it is passed through
         to vLLM's initialize_model().
         """
+        return self._load_or_reload_model(vllm_config, model_config, prefix)
+
+    def reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model: nn.Module,
+        prefix: str = "",
+    ) -> nn.Module:
+        """Reload weights into an already-initialized model.
+
+        Unlike `load_model`, `model` is required: the strategy chain runs
+        against this existing instance instead of building a fresh one via
+        `initialize_model()`. Strategies that stream weights through vLLM's
+        load_weights() run inside `initialize_layerwise_reload`/
+        `finalize_layerwise_reload` to avoid transient double-materialization;
+        the chain enters that per attempt, since RDMA writes into the existing
+        buffers and must not have them deferred to meta.
+        """
+        return self._load_or_reload_model(vllm_config, model_config, prefix, model)
+
+    def _load_or_reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str = "",
+        model: nn.Module | None = None,
+    ) -> nn.Module:
+        """Load model, auto-detecting the best loading strategy.
+
+        `prefix` is vLLM's BaseModelLoader.load_model argument for initializing
+        a model subtree. ModelExpress does not interpret it; it is passed through
+        to vLLM's initialize_model().
+        """
         load_start = time.perf_counter()
 
         is_speculative_draft = _is_speculative_draft(vllm_config, model_config)
@@ -137,6 +171,11 @@ class MxModelLoader(BaseModelLoader):
         # L0 wraps everything below, and the four L1 phases inside it are
         # disjoint, so their sum is bounded by the total by construction. The
         # timers only bracket existing calls; nothing here changes load order.
+
+        is_reload = False
+        if model is not None:
+            is_reload = True
+            
         model_id = ctx.identity.model_name
         with metrics.time_load("vllm", model_id, model_role):
             with maybe_enter_vmm_arena(ctx):
@@ -145,14 +184,21 @@ class MxModelLoader(BaseModelLoader):
                         install_vllm_cache_artifacts(ctx)
                 with set_default_torch_dtype(model_config.dtype):
                     with ctx.target_device:
-                        with metrics.time_load_phase("vllm", model_id, "model_init"):
-                            model = initialize_model(
-                                vllm_config=vllm_config,
-                                model_config=model_config,
-                                prefix=prefix,
-                            )
+                        if model is None:
+                            with metrics.time_load_phase("vllm", model_id, "model_init"):
+                                model = initialize_model(
+                                    vllm_config=vllm_config,
+                                    model_config=model_config,
+                                    prefix=prefix,
+                                )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
+                        # Which strategy wins decides whether layerwise reload
+                        # applies at all, so the chain enters and leaves it per
+                        # attempt rather than this being decided up front. RDMA
+                        # writes zero-copy into the final buffers and needs the
+                        # model's storage left intact.
+                        ctx.is_reload = is_reload
                         model = run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled:
