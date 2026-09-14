@@ -93,3 +93,4 @@ class LoadContext:
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
     skip_post_process: bool = False
+    skip_allocate: bool = False

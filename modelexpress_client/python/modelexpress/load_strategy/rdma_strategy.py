@@ -481,6 +481,7 @@ class RdmaStrategy(LoadStrategy):
     ) -> LoadResult:
         """Receive fully-processed weights via RDMA from an existing source."""
         try:
+            result.skip_allocate = True
             result = ctx.adapter.prepare_rdma_target(result)
             result = ctx.adapter.before_rdma_receive(result)
             self._receive_from_peer(result, ctx, source_worker, mx_source_id)

@@ -234,6 +234,9 @@ class VllmAdapter(EngineAdapter):
         if result.model is None:
             raise RuntimeError("vLLM RDMA target preparation requires result.model")
 
+        if result.skip_allocate:
+            return result
+
         from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 
         dummy_config = copy.copy(self.load_config)
