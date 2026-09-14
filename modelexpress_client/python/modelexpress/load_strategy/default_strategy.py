@@ -30,7 +30,8 @@ class DefaultStrategy(LoadStrategy):
             result = ctx.adapter.load_via_native(result)
             logger.info(f"[Worker {ctx.global_rank}] Weights loaded from disk")
 
-            result = ctx.adapter.after_native_load(result)
+            if not ctx.skip_post_process:
+                result = ctx.adapter.after_native_load(result)
         except Exception as e:
             raise StrategyFailed(str(e), mutated=True) from e
 
