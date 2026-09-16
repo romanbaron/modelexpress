@@ -268,16 +268,14 @@ class MxModelLoader(BaseModelLoader):
     def on_sleep(self, level: int) -> None:
         """Stop P2P source-serving before vLLM's sleep() invalidates the GPU
         memory this loader registered with NIXL.
+
+        Applies regardless of level: both level 1 (offload) and level 2
+        (discard) unmap the physical GPU pages backing the registered
+        virtual addresses, so a peer's RDMA read against either would hit
+        invalid memory.
         """
         self._last_sleep_level = level
         if self._ctx is None:
-            return
-
-        if level != 1:
-            logger.warning(
-                f"MxModelLoader only supports vLLM sleep level 1, got level "
-                f"{level}; P2P source-serving will not resume on wake_up()"
-            )
             return
 
         unpublish_metadata(self._ctx)
@@ -289,23 +287,30 @@ class MxModelLoader(BaseModelLoader):
         """Resume P2P source-serving once vLLM's wake_up() has restored
         valid GPU memory.
 
-        Only for level 1: wake_up() restores offloaded weights to GPU.
-        wake_up() doesn't carry the sleep level itself, so this reads it
-        back from what on_sleep() recorded.
+        Only for level 1: wake_up() restores offloaded weights to GPU. For
+        level 2, weights are discarded with no backup -- content is only
+        valid again once reload_weights() actually repopulates them, which
+        fires on_weights_reloaded() instead. wake_up() doesn't carry the
+        sleep level itself, so this reads it back from what on_sleep()
+        recorded.
         """
         if self._ctx is None:
             return
 
-        if self._last_sleep_level != 1:
-            logger.warning(
-                "MxModelLoader.on_wake_up() called after a non-level-1 "
-                f"sleep ({self._last_sleep_level}); skipping since weight "
-                "content is not guaranteed to be valid"
-            )
+        wake_weights = tags is None or "weights" in tags
+        if self._last_sleep_level != 1 or not wake_weights:
             return
 
-        wake_weights = tags is None or "weights" in tags
-        if not wake_weights:
+        if self._ctx.nixl_manager is None:
+            register_tensors(None, self._ctx, reuse_discovered=True)
+        publish_metadata(self._ctx)
+
+    def on_weights_reloaded(self) -> None:
+        """Resume P2P source-serving after reload_weights() refreshes this
+        model's weight content in place (the level-2 wake path, and any
+        weight reload that happens with no preceding sleep).
+        """
+        if self._ctx is None:
             return
 
         if self._ctx.nixl_manager is None:

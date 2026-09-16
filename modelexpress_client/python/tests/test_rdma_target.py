@@ -46,7 +46,7 @@ def test_prepare_rdma_target_strips_extra_config_for_dummy_loader():
         {"distributed": True, "memory_limit": 10_000_000_000}
     )
     patcher, loader_cls = _patch_dummy_loader()
-    result = SimpleNamespace(model=torch.nn.Module())
+    result = SimpleNamespace(model=torch.nn.Module(), skip_allocate=False)
 
     with patcher:
         adapter.prepare_rdma_target(result)
@@ -65,7 +65,7 @@ def test_prepare_rdma_target_handles_empty_extra_config():
     # Default MX usage has no extra config; behaviour must be unchanged.
     adapter, _source_config = _make_adapter({})
     patcher, loader_cls = _patch_dummy_loader()
-    result = SimpleNamespace(model=torch.nn.Module())
+    result = SimpleNamespace(model=torch.nn.Module(), skip_allocate=False)
 
     with patcher:
         adapter.prepare_rdma_target(result)
