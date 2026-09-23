@@ -76,7 +76,8 @@ class InstantTensorStrategy(LoadStrategy):
         try:
             result = ctx.adapter.apply_weight_iter(result, weights_iter)
             logger.info(f"[Worker {ctx.global_rank}] InstantTensor weight loading complete")
-            result = ctx.adapter.after_weight_iter_load(result)
+            if not ctx.skip_post_process:
+                result = ctx.adapter.after_weight_iter_load(result)
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] InstantTensor loading failed, falling through: {e}"

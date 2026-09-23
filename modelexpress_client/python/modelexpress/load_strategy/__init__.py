@@ -11,6 +11,7 @@ MxModelLoader iterates the chain until one succeeds.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 
 import torch.nn as nn
 
@@ -101,6 +102,37 @@ class LoadStrategyChain:
             ) from exc
 
 
+@contextmanager
+def _streaming_reload(
+    ctx: LoadContext,
+    strategy: LoadStrategy,
+    result: LoadResult,
+):
+    """Run a reload attempt inside the engine's layerwise reload, when it applies.
+
+    Only strategies that hand weights to the engine through its own
+    load_weights() callbacks can use deferred materialization; see
+    LoadStrategy.delivers_via_load_weights. Entering it per attempt rather than
+    once around the whole chain is what lets a fallback start from an intact
+    model: the engine is always taken back out before the chain reinitializes
+    or moves on.
+    """
+    active = (
+        ctx.is_reload
+        and strategy.delivers_via_load_weights
+        and ctx.adapter is not None
+    )
+    if not active:
+        yield
+        return
+
+    ctx.adapter.begin_streaming_reload(result)
+    try:
+        yield
+    finally:
+        ctx.adapter.end_streaming_reload(result)
+
+
 def execute_load_strategies(
     model: nn.Module,
     ctx: LoadContext,
@@ -119,7 +151,8 @@ def execute_load_strategies(
         for strategy in eligible:
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
             try:
-                result = strategy.load(result, ctx)
+                with _streaming_reload(ctx, strategy, result):
+                    result = strategy.load(result, ctx)
                 publish_source_if_supported(result, ctx)
                 span.set_attribute("weight_loading_strategy", strategy.name)
                 return result.value

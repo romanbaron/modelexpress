@@ -44,6 +44,10 @@ class LoadResult(Generic[T]):
     model: nn.Module | None = None
     publishable: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Set by RdmaStrategy before prepare_rdma_target(): the RDMA receive path
+    # fills tensors via NIXL, so the adapter must skip its own dummy-load
+    # allocation instead of overwriting them.
+    skip_allocate: bool = False
 
     @property
     def model_for_publish(self) -> nn.Module | None:
@@ -92,3 +96,10 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+    skip_post_process: bool = False
+    # Whether this run refreshes weights in an already-initialized model
+    # rather than loading into a freshly built one. While set, strategies that
+    # deliver weights through the engine's load_weights() callbacks are run
+    # inside the engine's layerwise reload; see
+    # LoadStrategy.delivers_via_load_weights.
+    is_reload: bool = False
