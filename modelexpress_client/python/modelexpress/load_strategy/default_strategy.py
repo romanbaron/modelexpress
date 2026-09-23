@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 
 from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from .base import LoadContext, LoadStrategy, _as_load_result
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_default")
@@ -28,12 +28,11 @@ class DefaultStrategy(LoadStrategy):
         logger.info(f"[Worker {ctx.global_rank}] Loading weights from disk...")
         try:
             result = ctx.adapter.load_via_native(result)
-            logger.info(f"[Worker {ctx.global_rank}] Weights loaded from disk")
-
-            result = ctx.adapter.after_native_load(result)
         except Exception as e:
             raise StrategyFailed(str(e), mutated=True) from e
 
-        if result.model_for_publish is not None:
-            register_tensors(result, ctx)
+        logger.info(f"[Worker {ctx.global_rank}] Weights loaded from disk")
         return result
+
+    def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
+        ctx.adapter.after_native_load(result)

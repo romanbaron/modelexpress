@@ -1008,6 +1008,11 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 **MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft uses the remaining eligible non-P2P strategies: server cache, InstantTensor, ModelStreamer, GDS, or the runtime's native loader. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
 
+**Sleep/wake lifecycle hooks.** `MxModelLoader` implements vLLM's optional `BaseModelLoader.on_sleep(level)` / `on_wake_up(tags)` / `on_weights_reloaded()` hooks so a sleeping replica stops advertising itself as a P2P source before `sleep()` unmaps its GPU memory.
+- `on_sleep` calls `unpublish_metadata` (gates discovery) and `nixl_manager.shutdown()` (stops receiving new requests from peers), regardless of sleep level.
+- `on_wake_up` recreates the NIXL agent and calls `publish_metadata` to mark the replica ready for new incoming P2P connections, but only for level 1 -- level 2 discards weights with no backup, so content isn't valid again until `reload_weights()` repopulates it.
+- `on_weights_reloaded` recreates the NIXL agent and republishes after `reload_weights()` (via `reload_model()`, see below) refreshes weight content in place -- the level-2 wake path, and any reload with no preceding sleep.
+
 ### vLLM Refit Installation
 
 The vLLM integration exposes engine installation and tensor geometry to
@@ -1117,6 +1122,8 @@ selection and source discovery remain inside the ModelExpress package.
 **LoadStrategyChain** (`load_strategy/`):
 
 Auto-detects the best loading strategy with a prioritized chain. Each strategy is a subclass of `LoadStrategy` (ABC) with `is_available(ctx)` and `load(result, ctx)` methods. Engine-specific work is delegated to `ctx.adapter`; `LoadResult` carries the value returned to the engine plus the model used for tensor discovery and publication. The chain filters to eligible strategies and runs them in order until one succeeds:
+
+The chain, not the strategy, decides what wraps an attempt, so no strategy branches on whether it was called for a cold load or a reload. A strategy declares only how it delivers weights (`delivers_via_load_weights`, and `registers_tensors_during_load`); from that the chain runs either `prepare()` → `load()` → `finalize()` → NIXL registration on a cold load, or, on a reload, the engine's layerwise reload around `load()` for strategies that stream through the engine's `load_weights()` callbacks. A reload needs neither `prepare()` nor `finalize()`: the model already has real storage and is already in its processed layout, and layerwise reload runs `process_weights_after_loading` per layer as each one materializes. `RdmaStrategy` opts out of both — it writes zero-copy into buffers layerwise reload would have released, and it registers them mid-transfer because the source cannot write into unregistered memory.
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|

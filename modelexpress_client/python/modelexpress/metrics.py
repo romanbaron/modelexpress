@@ -140,16 +140,20 @@ _ARTIFACT_STEP_BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 15, 30, 60, 120, 300)
 #:
 #:   metadata   GetMetadata, plus the tensor-manifest fetch when the response
 #:              did not carry one. Before the transfer span opens.
-#:   prepare    the adapter readies the target model to receive
+#:   prepare    the adapter readies the target model to receive. The chain
+#:              runs this before handing off to the strategy, and only on a
+#:              cold load, so it sits outside the transfer span.
 #:   register   NIXL memory registration and the agent metadata blob
 #:   handshake  loading the peer's NIXL metadata (fetched P2P, or added from
 #:              the central record)
 #:   receive    name matching, descriptor prep, the RDMA READ, and the sync
-#:   finalize   the adapter's post-receive processing
+#:   finalize   the adapter's post-receive processing. Outside the transfer
+#:              span for the same reason as ``prepare``.
 #:   release    dropping the remote agent
 #:
-#: ``mx_p2p_transfer_seconds`` covers everything after ``metadata``, so
-#: ``sum(phase != "metadata") <= transfer`` and ``sum(all) <= the rdma attempt``.
+#: ``mx_p2p_transfer_seconds`` covers the phases the strategy runs itself, so
+#: ``sum(phase not in {"metadata", "prepare", "finalize"}) <= transfer`` and
+#: ``sum(all) <= the rdma attempt``.
 #: The ``receive`` phase is the wire plus the descriptor work around it; splitting
 #: those apart would mean timing inside the NIXL manager rather than around it.
 SOURCE_ATTEMPT_PHASES = (

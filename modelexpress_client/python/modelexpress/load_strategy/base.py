@@ -75,6 +75,57 @@ class LoadStrategy(ABC):
     name: str
     requires: ClassVar[tuple] = ()
 
+    # Whether this strategy hands weights to the engine through its own
+    # load_weights() callbacks.
+    #
+    # On a reload that decides whether the engine's layerwise (deferred)
+    # materialization applies. Layerwise reload puts parameters back on the
+    # meta device and materializes each layer as its weights arrive through
+    # those callbacks, which is what keeps a reload from transiently holding
+    # two copies of the model. Strategies that stream weights (InstantTensor,
+    # ModelStreamer, ServerCache, the engine's native loader -- and vLLM's own
+    # NCCL/IPC transfer engines) satisfy that contract.
+    #
+    # RDMA and GDS do not: they write zero-copy straight into the final
+    # registered buffers, which is exactly where their speed comes from. Under
+    # layerwise reload those buffers do not exist yet, so the transfer lands
+    # nowhere the model executes against and every weight silently keeps its
+    # dummy value. They need the model's storage left intact instead.
+    delivers_via_load_weights: ClassVar[bool] = True
+
+    # Whether this strategy registers the model's tensors with NIXL itself,
+    # as part of how it moves weights.
+    #
+    # RDMA does: the target's buffers must be registered before the source can
+    # write into them, so registration happens mid-transfer rather than after.
+    # Every other strategy leaves it to the chain, which registers once the
+    # model has reached its final processed layout -- the only state tensor
+    # discovery is meant to run against.
+    registers_tensors_during_load: ClassVar[bool] = False
+
+    def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Bring the model to the state this strategy needs before loading.
+
+        Runs only on a cold load. A reload enters the engine's layerwise
+        reload instead (for strategies that deliver through its load_weights()
+        callbacks) or nothing at all, so a strategy never has to ask which
+        case it is in.
+
+        Works on ``result`` in place: it is the stable envelope the chain
+        holds for the whole attempt.
+        """
+
+    def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Bring the loaded weights to their final runtime layout.
+
+        Runs only on a cold load, and only after `load` succeeded. On a
+        reload the engine's layerwise reload does this per layer as each one
+        materializes, and a strategy that received already-processed weights
+        needs it not to run at all.
+
+        Works on ``result`` in place, like :meth:`prepare`.
+        """
+
     def is_available(self, ctx: LoadContext) -> bool:
         """Check environment: is this strategy usable right now?"""
         if not self.requires:
@@ -234,6 +285,31 @@ def register_tensors(
                 ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
+        # Registration failed, so there is nothing for this worker to serve.
+        # Drop the manager instead of leaving it half-initialized, for two
+        # reasons:
+        #
+        # 1. The agent created above owns the metadata listener socket on
+        #    MX_METADATA_PORT + device_id. Leaking it makes every subsequent
+        #    attempt die on "Address already in use", turning a single
+        #    recoverable failure into a permanent one for the life of the
+        #    process -- the re-registration that runs after a CRIU restore
+        #    never gets its port back.
+        # 2. publish_metadata() treats a non-None manager as "ready to serve",
+        #    so a half-initialized one gets advertised to the MX server and
+        #    peers select a source that cannot transfer.
+        if ctx.nixl_manager is not None:
+            try:
+                ctx.nixl_manager.shutdown()
+            except Exception:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] Failed to shut down NIXL manager "
+                    "after registration failure; the metadata listener port may "
+                    "stay bound",
+                    exc_info=True,
+                )
+            finally:
+                ctx.nixl_manager = None
         logger.warning(
             f"[Worker {ctx.global_rank}] NIXL registration failed, "
             f"worker will continue without P2P serving: {e}"

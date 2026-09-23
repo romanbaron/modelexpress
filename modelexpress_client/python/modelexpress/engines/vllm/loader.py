@@ -36,6 +36,7 @@ from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import (
     LoadContext,
     publish_metadata,
+    register_tensors,
     run_load_strategy_chain,
     unpublish_metadata,
 )
@@ -89,12 +90,49 @@ class MxModelLoader(BaseModelLoader):
         # you most need to diagnose. No-op unless enabled; never raises.
         enable_metrics()
         self._ctx: LoadContext | None = None
+        # Set by on_sleep(), consulted by on_wake_up(): wake_up(tags) doesn't
+        # carry the preceding sleep's level, so this loader remembers it.
+        self._last_sleep_level: int | None = None
 
     def load_model(
         self,
         vllm_config: VllmConfig,
         model_config: ModelConfig,
         prefix: str = "",
+    ) -> nn.Module:
+        """Load model, auto-detecting the best loading strategy.
+
+        `prefix` is vLLM's BaseModelLoader.load_model argument for initializing
+        a model subtree. ModelExpress does not interpret it; it is passed through
+        to vLLM's initialize_model().
+        """
+        return self._load_or_reload_model(vllm_config, model_config, prefix)
+
+    def reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model: nn.Module,
+        prefix: str = "",
+    ) -> nn.Module:
+        """Reload weights into an already-initialized model.
+
+        Unlike `load_model`, `model` is required: the strategy chain runs
+        against this existing instance instead of building a fresh one via
+        `initialize_model()`. Strategies that stream weights through vLLM's
+        load_weights() run inside `initialize_layerwise_reload`/
+        `finalize_layerwise_reload` to avoid transient double-materialization;
+        the chain enters that per attempt, since RDMA writes into the existing
+        buffers and must not have them deferred to meta.
+        """
+        return self._load_or_reload_model(vllm_config, model_config, prefix, model)
+
+    def _load_or_reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str = "",
+        model: nn.Module | None = None,
     ) -> nn.Module:
         """Load model, auto-detecting the best loading strategy.
 
@@ -133,6 +171,11 @@ class MxModelLoader(BaseModelLoader):
         # L0 wraps everything below, and the four L1 phases inside it are
         # disjoint, so their sum is bounded by the total by construction. The
         # timers only bracket existing calls; nothing here changes load order.
+
+        is_reload = False
+        if model is not None:
+            is_reload = True
+            
         model_id = ctx.identity.model_name
         with metrics.time_load("vllm", model_id, model_role):
             with maybe_enter_vmm_arena(ctx):
@@ -141,14 +184,21 @@ class MxModelLoader(BaseModelLoader):
                         install_vllm_cache_artifacts(ctx)
                 with set_default_torch_dtype(model_config.dtype):
                     with ctx.target_device:
-                        with metrics.time_load_phase("vllm", model_id, "model_init"):
-                            model = initialize_model(
-                                vllm_config=vllm_config,
-                                model_config=model_config,
-                                prefix=prefix,
-                            )
+                        if model is None:
+                            with metrics.time_load_phase("vllm", model_id, "model_init"):
+                                model = initialize_model(
+                                    vllm_config=vllm_config,
+                                    model_config=model_config,
+                                    prefix=prefix,
+                                )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
+                        # Which strategy wins decides whether layerwise reload
+                        # applies at all, so the chain enters and leaves it per
+                        # attempt rather than this being decided up front. RDMA
+                        # writes zero-copy into the final buffers and needs the
+                        # model's storage left intact.
+                        ctx.is_reload = is_reload
                         model = run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled:
@@ -213,6 +263,58 @@ class MxModelLoader(BaseModelLoader):
         except AttributeError:
             object.__setattr__(disk_config, "load_format", "auto")
         DefaultModelLoader(disk_config).load_weights(model, model_config)
+
+    def on_sleep(self, level: int) -> None:
+        """Stop P2P source-serving before vLLM's sleep() invalidates the GPU
+        memory this loader registered with NIXL.
+
+        Applies regardless of level: both level 1 (offload) and level 2
+        (discard) unmap the physical GPU pages backing the registered
+        virtual addresses, so a peer's RDMA read against either would hit
+        invalid memory.
+        """
+        self._last_sleep_level = level
+        if self._ctx is None:
+            return
+
+        unpublish_metadata(self._ctx)
+        if self._ctx.nixl_manager is not None:
+            self._ctx.nixl_manager.shutdown()
+            self._ctx.nixl_manager = None
+
+    def on_wake_up(self, tags: list[str] | None) -> None:
+        """Resume P2P source-serving once vLLM's wake_up() has restored
+        valid GPU memory.
+
+        Only for level 1: wake_up() restores offloaded weights to GPU. For
+        level 2, weights are discarded with no backup -- content is only
+        valid again once reload_weights() actually repopulates them, which
+        fires on_weights_reloaded() instead. wake_up() doesn't carry the
+        sleep level itself, so this reads it back from what on_sleep()
+        recorded.
+        """
+        if self._ctx is None:
+            return
+
+        wake_weights = tags is None or "weights" in tags
+        if self._last_sleep_level != 1 or not wake_weights:
+            return
+
+        if self._ctx.nixl_manager is None:
+            register_tensors(None, self._ctx, reuse_discovered=True)
+        publish_metadata(self._ctx)
+
+    def on_weights_reloaded(self) -> None:
+        """Resume P2P source-serving after reload_weights() refreshes this
+        model's weight content in place (the level-2 wake path, and any
+        weight reload that happens with no preceding sleep).
+        """
+        if self._ctx is None:
+            return
+
+        if self._ctx.nixl_manager is None:
+            register_tensors(None, self._ctx, reuse_discovered=True)
+        publish_metadata(self._ctx)
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:

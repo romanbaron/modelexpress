@@ -11,6 +11,7 @@ MxModelLoader iterates the chain until one succeeds.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 
 import torch.nn as nn
 
@@ -101,6 +102,84 @@ class LoadStrategyChain:
             ) from exc
 
 
+def _run_phase(phase, result: LoadResult, ctx: LoadContext) -> None:
+    """Run one phase, reporting any failure as a mutated one.
+
+    Both phases write into the model, so a strategy that falls through after
+    one failed leaves the next needing a reinitialized model -- the same
+    contract these calls carried when they lived inside load().
+    """
+    try:
+        phase(result, ctx)
+    except StrategyFailed:
+        raise
+    except Exception as e:
+        raise StrategyFailed(str(e), mutated=True) from e
+
+
+@contextmanager
+def _strategy_phases(
+    strategy: LoadStrategy,
+    result: LoadResult,
+    ctx: LoadContext,
+):
+    """Wrap one attempt in the phases its situation calls for.
+
+    A strategy declares only how it delivers weights; which phases wrap it is
+    decided here, so no strategy has to branch on whether this is a cold load
+    or a reload.
+
+    Cold load: the strategy's own prepare() gets the model into the state it
+    needs, and finalize() converts the raw weights it loaded into their final
+    runtime layout. finalize() sits after the yield rather than in a finally,
+    because a failed attempt has nothing to bring to a final layout.
+
+    Reload: the model is already in that layout and already has real storage,
+    so neither applies. Strategies that hand weights to the engine through its
+    own load_weights() callbacks run inside the engine's layerwise reload
+    instead, which materializes and processes each layer as its weights
+    arrive; that one is left in a finally, so a fallback never starts against
+    a model still deferred to meta. Strategies that write straight into the
+    existing buffers (RDMA, GDS) receive weights the source already processed
+    and need no phase at all.
+
+    Every phase runs through the adapter, so without one there is nothing to
+    wrap either way. The phases work on ``result`` in place: LoadResult is the
+    stable envelope the chain holds for the whole attempt, which is why
+    reinit_for_retry copies a replacement's state back into it rather than
+    handing one out.
+    """
+    if ctx.adapter is None:
+        yield
+        return
+
+    if ctx.is_reload:
+        if not strategy.delivers_via_load_weights:
+            yield
+            return
+
+        ctx.adapter.begin_streaming_reload(result)
+        try:
+            yield
+        finally:
+            ctx.adapter.end_streaming_reload(result)
+        return
+
+    _run_phase(strategy.prepare, result, ctx)
+    yield
+    _run_phase(strategy.finalize, result, ctx)
+
+
+def _run_strategy_attempt(
+    strategy: LoadStrategy,
+    result: LoadResult,
+    ctx: LoadContext,
+) -> LoadResult:
+    """Run one attempt from end to end: its phases, and the load between them."""
+    with _strategy_phases(strategy, result, ctx):
+        return strategy.load(result, ctx)
+
+
 def execute_load_strategies(
     model: nn.Module,
     ctx: LoadContext,
@@ -119,7 +198,17 @@ def execute_load_strategies(
         for strategy in eligible:
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
             try:
-                result = strategy.load(result, ctx)
+                with _strategy_phases(strategy, result, ctx):
+                    result = strategy.load(result, ctx)
+                # Discovery has to see the model in its final layout, which is
+                # only true once the phases above are done. RDMA is the
+                # exception: its target buffers must already be registered for
+                # the source to write into, so it registers mid-transfer.
+                if (
+                    not strategy.registers_tensors_during_load
+                    and result.model_for_publish is not None
+                ):
+                    register_tensors(result, ctx)
                 publish_source_if_supported(result, ctx)
                 span.set_attribute("weight_loading_strategy", strategy.name)
                 return result.value
