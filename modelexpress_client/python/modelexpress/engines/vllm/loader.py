@@ -56,10 +56,6 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import initialize_model
 from vllm.utils.torch_utils import set_default_torch_dtype
-from vllm.model_executor.model_loader.reload import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -123,9 +119,11 @@ class MxModelLoader(BaseModelLoader):
 
         Unlike `load_model`, `model` is required: the strategy chain runs
         against this existing instance instead of building a fresh one via
-        `initialize_model()`, and the reload is wrapped in
-        `initialize_layerwise_reload`/`finalize_layerwise_reload` to avoid
-        transient double-materialization of the model's memory.
+        `initialize_model()`. Strategies that stream weights through vLLM's
+        load_weights() run inside `initialize_layerwise_reload`/
+        `finalize_layerwise_reload` to avoid transient double-materialization;
+        the chain enters that per attempt, since RDMA writes into the existing
+        buffers and must not have them deferred to meta.
         """
         return self._load_or_reload_model(vllm_config, model_config, prefix, model)
 
@@ -195,12 +193,18 @@ class MxModelLoader(BaseModelLoader):
                                 )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
-                        if is_reload:
-                            initialize_layerwise_reload(model)
-                            ctx.skip_post_process = True
+                        # Which strategy wins decides whether layerwise reload
+                        # applies at all, so the chain enters and leaves it per
+                        # attempt rather than this being decided up front. RDMA
+                        # writes zero-copy into the final buffers and needs the
+                        # model's storage left intact.
+                        ctx.is_reload = is_reload
+                        # Independent of which strategy runs: a reload targets a
+                        # model whose derived host-side state was already built
+                        # on the first load, so re-running post-processing would
+                        # reject it as not cold-loaded.
+                        ctx.skip_post_process = is_reload
                         model = run_load_strategy_chain(model, ctx)
-                        if is_reload:
-                            finalize_layerwise_reload(model, model_config)
 
                     if ctx.p2p_enabled:
                         _loader_registry[ctx.device_id] = self

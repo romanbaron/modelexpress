@@ -97,3 +97,9 @@ class LoadContext:
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
     skip_post_process: bool = False
+    # Whether this run refreshes weights in an already-initialized model
+    # rather than loading into a freshly built one. While set, strategies that
+    # deliver weights through the engine's load_weights() callbacks are run
+    # inside the engine's layerwise reload; see
+    # LoadStrategy.delivers_via_load_weights.
+    is_reload: bool = False

@@ -96,6 +96,10 @@ class RdmaStrategy(LoadStrategy):
 
     name = "rdma"
     requires = (EngineAdapter.discover_tensors,)
+    # Weights land zero-copy in the final registered buffers rather than
+    # passing through the engine's load_weights(), so a reload must leave the
+    # model's storage intact instead of deferring materialization.
+    delivers_via_load_weights = False
 
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
