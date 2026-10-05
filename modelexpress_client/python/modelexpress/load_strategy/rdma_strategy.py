@@ -97,6 +97,53 @@ class RdmaStrategy(LoadStrategy):
     name = "rdma"
     requires = (EngineAdapter.discover_tensors,)
 
+    def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Nothing to do before load(); the target is prepared in _load_as_target.
+
+        Preparing the target rewrites the model into the source's processed
+        layout, so it can only happen once a source has been selected: a miss
+        with no source would otherwise hand the next strategy a model it
+        cannot stream raw checkpoint weights into, while reporting itself as
+        not mutated. It also has to run again for every candidate, because a
+        failed candidate leaves a reinitialized model behind.
+
+        A reload target needs no preparation at all: it already has real
+        storage, in the processed layout it was post-processed into before the
+        checkpoint. Re-running that processing is not merely redundant, it is
+        destructive -- vLLM's post-load processing is not idempotent.
+        convert_moe_weights_to_flashinfer_trtllm_block_layout reshapes MoE
+        experts from [E, rows, cols] to [E, cols/block_k, rows, block_k], then
+        on a second pass tries to unpack two dims from its own 4-D output and
+        dies with "too many values to unpack (expected 2)", taking the whole
+        RDMA attempt with it.
+
+        Overridden rather than inherited so a reload never enters the engine's
+        layerwise reload: weights land zero-copy in the existing buffers
+        rather than passing through load_weights(), and deferring those
+        buffers to meta would leave the transfer nowhere the model executes
+        against.
+        """
+
+    def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Nothing to do after load(); the received weights are finalized in
+        _load_as_target.
+
+        Finalizing there keeps it inside the candidate loop, so a failure
+        retries the next source on a reinitialized model. A reload target
+        skips it: it has already been through post-processing and has served
+        requests, so its derived host-side state (attention scale mirrors,
+        FlashInfer's bmm1_scale/bmm2_scale cache) is populated and the
+        finalizers reject it as not cold-loaded.
+
+        Overridden rather than inherited: the default would register tensors
+        the transfer already registered, and on a reload leave a layerwise
+        reload this strategy never entered.
+        """
+
+    def abort(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Nothing to undo: prepare() starts no engine state, and rollback()
+        releases the NIXL state the transfer acquired."""
+
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
         if ctx.nixl_manager is not None:
@@ -487,14 +534,28 @@ class RdmaStrategy(LoadStrategy):
         policy = configured_policy_label()
         try:
             with selection_metrics.time_source_attempt_phase(policy, "prepare"):
-                result = ctx.adapter.prepare_rdma_target(result)
-                result = ctx.adapter.before_rdma_receive(result)
+                # A reload target is already prepared; see prepare().
+                if not ctx.is_reload:
+                    result = ctx.adapter.prepare_rdma_target(result)
+                    result = ctx.adapter.before_rdma_receive(result)
             self._receive_from_peer(result, ctx, source_worker, mx_source_id)
             with selection_metrics.time_source_attempt_phase(policy, "finalize"):
-                return ctx.adapter.after_rdma_receive(result)
+                # A reload target is already finalized; see finalize().
+                if not ctx.is_reload:
+                    result = ctx.adapter.after_rdma_receive(result)
+                return result
         except StrategyFailed:
             raise
         except Exception as e:
+            # The chain clears tracebacks on a mutated StrategyFailed before
+            # falling back (see clear_exception_tracebacks), so by the time this
+            # surfaces in the logs only the message survives -- "too many values
+            # to unpack (expected 2)" with no frame is not actionable. Record
+            # the frames here, while they still exist.
+            logger.exception(
+                f"[Worker {ctx.global_rank}] RDMA target load failed "
+                f"(source_worker_id={source_worker_id}, mx_source_id={mx_source_id})"
+            )
             raise StrategyFailed(str(e), mutated=True) from e
 
     def _receive_from_peer(
@@ -509,6 +570,18 @@ class RdmaStrategy(LoadStrategy):
         policy = configured_policy_label()
         with selection_metrics.time_source_attempt_phase(policy, "register"):
             register_tensors(result, ctx)
+
+        # register_tensors() is best-effort: it logs and swallows, leaving
+        # ctx.nixl_manager unset when registration failed. Everything below
+        # dereferences it, so without this the real cause (which register_tensors
+        # already logged in full) is replaced by an AttributeError on NoneType
+        # several frames later.
+        if ctx.nixl_manager is None:
+            raise StrategyFailed(
+                "NIXL registration failed, cannot receive weights over RDMA "
+                "(see the preceding registration error for the cause)",
+                mutated=True,
+            )
 
         is_p2p = bool(source_worker.worker_grpc_endpoint)
         remote_agent_name = None
@@ -626,9 +699,21 @@ class RdmaStrategy(LoadStrategy):
             # process exit: the engine process is torn down without running atexit
             # hooks, and in P2P only the reader holds a record of the peer to
             # invalidate. None means acquisition failed with nothing to release.
-            if remote_agent_name is not None:
-                with selection_metrics.time_source_attempt_phase(policy, "release"):
-                    ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+            if remote_agent_name is not None and ctx.nixl_manager is not None:
+                # Release is best-effort. Raising from a finally: replaces the
+                # exception that is unwinding through it, so a failure here would
+                # report itself as the reason the transfer failed and bury the
+                # real one.
+                try:
+                    with selection_metrics.time_source_attempt_phase(policy, "release"):
+                        ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+                except Exception:
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Failed to release source agent "
+                        f"'{remote_agent_name}'; it may stay connected until the "
+                        "process exits",
+                        exc_info=True,
+                    )
 
         total_time = time.perf_counter() - receive_start
         logger.info(
