@@ -46,8 +46,6 @@ The socket is a `SOCK_SEQPACKET` unix socket that carries JSON messages
 
 ## ModelExpress side
 
-### Reload of sleeping weights: the `local_mirror` load strategy
-
 This is the first strategy in the chain. To enable it, set
 `MX_LOCAL_MIRROR_RELOAD_SOCKET`, for example
 `/tmp/mx-local-mirror-{rank}.sock`; `{rank}` is replaced with the local GPU
@@ -76,17 +74,6 @@ On failure, the strategy:
 Before trying any later strategy in the chain, the chain wakes the sleeping
 weights (`EngineAdapter.wake_sleeping_weights`). Only a strategy with
 `accepts_sleeping_weights = True` sees them asleep.
-
-### First load: `MX_LOCAL_MIRROR_SOCKET`
-
-A fresh engine on a GPU that runs a mirror builds the model on the meta
-device. It then runs the same pre-receive processing as an RDMA target and
-points every tensor at the mirror's copy of the source tensor with the same
-name.
-
-To size the engine's memory budget, vLLM must ask for
-`get_external_weight_memory`. MX waits up to `MX_LOCAL_MIRROR_TIMEOUT` for the
-mirror to finish copying.
 
 ## vLLM requirements
 
