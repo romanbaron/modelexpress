@@ -108,8 +108,8 @@ MX_LOCAL_MIRROR_RELOAD_SOCKET=/tmp/mx-local-mirror-{rank}.sock
 
 | Weights path on restore | Reload |
 |---|---|
-| `local_mirror`: 4 allocations mapped per GPU, finish 0.46 s | `reload_weights` 0.75 s |
-| Fallback to `rdma` | 4.15 s |
-| Fallback to `default` (disk) | 63.2 s |
+| `local_mirror`: 4 allocations swapped per GPU | `reload_weights` 0.71 s |
+| Fallback to `rdma` | 3.71 s |
+| Fallback to `default` (disk) | 61.0 s |
 
 The output was correct on all three paths.
