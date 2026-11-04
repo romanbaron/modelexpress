@@ -26,6 +26,7 @@ import torch
 from . import local_gpu, p2p_pb2
 from .load_strategy.context import LoadResult
 
+
 def _receive_regions(path: str, device: int):
     """The mirror's regions as {source_addr: (size, allocation_size, fd)},
     plus its header."""
