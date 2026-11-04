@@ -43,6 +43,11 @@ from ...load_strategy import (
     unpublish_metadata,
 )
 from ...load_strategy.draft_gate import DraftPublicationGate
+from ...local_mirror import (
+    load_from_local_mirror,
+    local_mirror_memory,
+    reload_on_local_mirror,
+)
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
@@ -111,6 +116,14 @@ class MxModelLoader(BaseModelLoader):
         # Set by on_sleep(), consulted by on_wake_up(): wake_up(tags) doesn't
         # carry the preceding sleep's level, so this loader remembers it.
         self._last_sleep_level: int | None = None
+
+    def get_external_weight_memory(self, vllm_config: VllmConfig) -> int:
+        """Bytes of weights a local mirror on this GPU holds for this engine.
+
+        vLLM excludes them from the engine's memory budget: the first load
+        builds the model on that memory instead of allocating its own.
+        """
+        return local_mirror_memory(torch.cuda.current_device())
 
     def load_model(
         self,
@@ -253,9 +266,20 @@ class MxModelLoader(BaseModelLoader):
                 if ctx.p2p_enabled and ctx.p2p_role == "main":
                     with metrics.time_load_phase("vllm", model_id, "artifact_install"):
                         install_vllm_cache_artifacts(ctx)
+                # A first load with a local mirror of a source on this GPU
+                # builds the model on that memory instead of allocating it; a
+                # reload of such a model has nothing to transfer.
+                adopted = None
+                if ctx.p2p_role == "main":
+                    if model is None:
+                        adopted = load_from_local_mirror(
+                            vllm_config, model_config, prefix, ctx
+                        )
+                    elif reload_on_local_mirror(model, ctx):
+                        adopted = model
                 with set_default_torch_dtype(model_config.dtype):
                     with ctx.target_device:
-                        if model is None:
+                        if model is None and adopted is None:
                             with metrics.time_load_phase("vllm", model_id, "model_init"):
                                 model = initialize_model(
                                     vllm_config=vllm_config,
@@ -263,8 +287,11 @@ class MxModelLoader(BaseModelLoader):
                                     prefix=prefix,
                                 )
 
-                    with metrics.time_load_phase("vllm", model_id, "chain"):
-                        model = self._run_load_strategy_chain(model, ctx)
+                    if adopted is not None:
+                        model = adopted
+                    else:
+                        with metrics.time_load_phase("vllm", model_id, "chain"):
+                            model = self._run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled and ctx.p2p_role == "draft":
                         if ctx.nixl_manager is not None:

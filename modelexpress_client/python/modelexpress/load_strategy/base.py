@@ -97,6 +97,10 @@ class LoadStrategy(ABC):
 
     name: str
     requires: ClassVar[tuple] = ()
+    # Whether load() can start on a reload whose weights are still asleep
+    # (addresses reserved, no memory behind them). Every other strategy
+    # writes into the weights, so the chain wakes them before trying it.
+    accepts_sleeping_weights: ClassVar[bool] = False
 
     def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
         """Bring the model to the state this strategy needs before loading.

@@ -69,6 +69,7 @@ class LoadStrategyChain:
         Returns the (possibly re-initialized) model on success.
         Raises RuntimeError if no strategy succeeds.
         """
+        from .local_mirror_strategy import LocalMirrorStrategy
         from .rdma_strategy import RdmaStrategy
         from .server_cache_strategy import ServerCacheStrategy
         from .instant_tensor_strategy import InstantTensorStrategy
@@ -79,6 +80,7 @@ class LoadStrategyChain:
         from ..plugins import get_plugin, initialize_plugins, validate_plugin_names
 
         all_strategies: list[LoadStrategy] = [
+            LocalMirrorStrategy(),
             RdmaStrategy(),
             ServerCacheStrategy(),
             InstantTensorStrategy(),
@@ -164,6 +166,14 @@ def execute_load_strategies(
 
         for strategy in eligible:
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
+            # A reload can start with the weights asleep; only a strategy that
+            # maps memory into them itself may see them that way.
+            if (
+                ctx.is_reload
+                and not strategy.accepts_sleeping_weights
+                and ctx.adapter is not None
+            ):
+                ctx.adapter.wake_sleeping_weights()
             try:
                 with _strategy_phases(strategy, result, ctx):
                     result = strategy.load(result, ctx)

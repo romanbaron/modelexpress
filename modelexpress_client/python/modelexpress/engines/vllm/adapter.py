@@ -310,6 +310,64 @@ class VllmAdapter(EngineAdapter):
 
         return bool(current_platform.is_cuda_alike())
 
+    # Sleeping weights: vLLM's CuMemAllocator (sleep mode) keeps one record per
+    # allocation, with handle = (device, size, address, p_handle), p_handle
+    # pointing at the malloc'd CUmemGenericAllocationHandle its
+    # unmap_and_release reads. A level-2 sleep releases the memory and leaves
+    # the address reserved.
+
+    @staticmethod
+    def _weights_records():
+        try:
+            from vllm.device_allocator.cumem import CuMemAllocator
+        except ImportError:
+            return []
+        allocator = CuMemAllocator.instance
+        if allocator is None:
+            return []
+        return [d for d in allocator.pointer_to_data.values() if d.tag == "weights"]
+
+    def wake_sleeping_weights(self) -> int:
+        asleep = [d for d in self._weights_records() if d.is_asleep]
+        if not asleep:
+            return 0
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        allocator = CuMemAllocator.get_instance()
+        # The worker's wake_up(weights) when it left one: it also restores the
+        # buffers saved at sleep, which a layerwise reload keeps and processes
+        # the weights with. Either way only what is still asleep is woken.
+        hook = getattr(allocator, "wake_weights_hook", None)
+        if hook is not None:
+            hook()
+        else:
+            allocator.wake_up(tags=["weights"])
+        logger.info(f"Woke {len(asleep)} sleeping weights allocations before the reload")
+        return len(asleep)
+
+    def sleeping_weight_allocations(self):
+        records = self._weights_records()
+        # On ROCm the handle slot is a chunk list, not one CUDA handle.
+        if not all(isinstance(d.handle[3], int) for d in records):
+            return []
+        return [(d.handle[2], d.handle[1], d) for d in records if d.is_asleep]
+
+    def map_weight_allocation(self, token, handle: int) -> None:
+        import ctypes
+
+        from ...local_gpu import map_at
+
+        device, size, address, p_handle = token.handle
+        map_at(address, size, handle, device)
+        ctypes.c_uint64.from_address(p_handle).value = handle
+        token.is_asleep = False
+
+    def unmap_weight_allocation(self, token) -> None:
+        from vllm.device_allocator.cumem import unmap_and_release
+
+        unmap_and_release(token.handle)
+        token.is_asleep = True
+
     def all_gather_state(self, state) -> tuple[object, ...]:
         """Gather rank-local state through vLLM's CPU process group."""
         from vllm.distributed import get_world_group

@@ -208,6 +208,35 @@ class EngineAdapter:
         """
         return None
 
+    def wake_sleeping_weights(self) -> int:
+        """Give every weights allocation still asleep physical memory again.
+
+        A reload can start while the engine's weights are asleep (a level-2
+        sleep keeps their virtual addresses and releases the memory). Only a
+        strategy with accepts_sleeping_weights maps memory into them itself;
+        the chain calls this before any other strategy, which writes into the
+        weights. Returns how many allocations were woken; engines without a
+        sleep mode have none.
+        """
+        return 0
+
+    @gated_capability
+    def sleeping_weight_allocations(self) -> list[tuple[int, int, Any]]:
+        """(address, size, token) of every weights allocation that is asleep:
+        virtual address reserved, no physical memory mapped. The token is
+        handed back to map_weight_allocation / unmap_weight_allocation."""
+
+    @gated_capability
+    def map_weight_allocation(self, token: Any, handle: int) -> None:
+        """Map a cuMem allocation handle (imported by the caller) at the
+        sleeping allocation's address and make the engine own it: a later
+        sleep or free releases it like memory the engine created."""
+
+    @gated_capability
+    def unmap_weight_allocation(self, token: Any) -> None:
+        """Undo map_weight_allocation: unmap and release the handle and mark
+        the allocation asleep again."""
+
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""
         return result
