@@ -310,14 +310,13 @@ class VllmAdapter(EngineAdapter):
 
         return bool(current_platform.is_cuda_alike())
 
-    # Sleeping weights: vLLM's CuMemAllocator (sleep mode) keeps one record per
-    # allocation, with handle = (device, size, address, p_handle), p_handle
-    # pointing at the malloc'd CUmemGenericAllocationHandle its
-    # unmap_and_release reads. A level-2 sleep releases the memory and leaves
-    # the address reserved.
+    # Weights allocations: vLLM's CuMemAllocator (sleep mode) keeps one record
+    # per allocation, with handle = (device, size, address, p_handle), p_handle
+    # pointing at the malloc'd CUmemGenericAllocationHandle that its
+    # unmap_and_release (sleep, free) reads. Swapping the memory behind an
+    # address therefore means remapping it and rewriting that slot.
 
-    @staticmethod
-    def _weights_records():
+    def weight_allocations(self):
         try:
             from vllm.device_allocator.cumem import CuMemAllocator
         except ImportError:
@@ -325,48 +324,45 @@ class VllmAdapter(EngineAdapter):
         allocator = CuMemAllocator.instance
         if allocator is None:
             return []
-        return [d for d in allocator.pointer_to_data.values() if d.tag == "weights"]
-
-    def wake_sleeping_weights(self) -> int:
-        asleep = [d for d in self._weights_records() if d.is_asleep]
-        if not asleep:
-            return 0
-        from vllm.device_allocator.cumem import CuMemAllocator
-
-        allocator = CuMemAllocator.get_instance()
-        # The worker's wake_up(weights) when it left one: it also restores the
-        # buffers saved at sleep, which a layerwise reload keeps and processes
-        # the weights with. Either way only what is still asleep is woken.
-        hook = getattr(allocator, "wake_weights_hook", None)
-        if hook is not None:
-            hook()
-        else:
-            allocator.wake_up(tags=["weights"])
-        logger.info(f"Woke {len(asleep)} sleeping weights allocations before the reload")
-        return len(asleep)
-
-    def sleeping_weight_allocations(self):
-        records = self._weights_records()
-        # On ROCm the handle slot is a chunk list, not one CUDA handle.
-        if not all(isinstance(d.handle[3], int) for d in records):
+        records = [d for d in allocator.pointer_to_data.values() if d.tag == "weights"]
+        # Asleep: no memory to swap. On ROCm the handle slot is a chunk list,
+        # not one CUDA handle.
+        if any(d.is_asleep or not isinstance(d.handle[3], int) for d in records):
             return []
-        return [(d.handle[2], d.handle[1], d) for d in records if d.is_asleep]
+        return [(d.handle[2], d.handle[1], d) for d in records]
 
-    def map_weight_allocation(self, token, handle: int) -> None:
+    def swap_weight_allocation(self, token, handle: int) -> int:
         import ctypes
 
-        from ...local_gpu import map_at
+        from ... import local_gpu
 
         device, size, address, p_handle = token.handle
-        map_at(address, size, handle, device)
-        ctypes.c_uint64.from_address(p_handle).value = handle
-        token.is_asleep = False
+        slot = ctypes.c_uint64.from_address(p_handle)
+        own = slot.value
+        local_gpu.unmap(address, size)
+        try:
+            local_gpu.map_at(address, size, handle, device)
+        except BaseException:
+            try:
+                local_gpu.unmap(address, size)
+            except RuntimeError:
+                pass
+            local_gpu.map_at(address, size, own, device)
+            raise
+        slot.value = handle
+        return own
 
-    def unmap_weight_allocation(self, token) -> None:
-        from vllm.device_allocator.cumem import unmap_and_release
+    def restore_weight_allocation(self, token, handle: int) -> None:
+        import ctypes
 
-        unmap_and_release(token.handle)
-        token.is_asleep = True
+        from ... import local_gpu
+
+        device, size, address, p_handle = token.handle
+        slot = ctypes.c_uint64.from_address(p_handle)
+        local_gpu.unmap(address, size)
+        local_gpu.release(slot.value)
+        local_gpu.map_at(address, size, handle, device)
+        slot.value = handle
 
     def all_gather_state(self, state) -> tuple[object, ...]:
         """Gather rank-local state through vLLM's CPU process group."""

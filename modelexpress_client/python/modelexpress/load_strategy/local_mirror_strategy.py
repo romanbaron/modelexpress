@@ -1,16 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Local mirror strategy: reload sleeping weights by mapping a mirror's copy.
+"""Local mirror strategy: reload the weights by swapping in a mirror's copy.
 
-A NIXL mirror (examples/local_nixl_mirror/nixl_mirror.py) on the same GPU holds a byte
-copy of the memory a READY MX source registered: the weights in their final,
-processed layout, at the source's addresses. Every replica restored from one
-CRIU snapshot has the same weights allocations at the same addresses, so on a
-reload after a level-2 sleep each sleeping allocation whose address and size
-match a mirror region gets that region mapped at its reserved address.
-Nothing is loaded, copied or processed, tensors keep their pointers, and CUDA
-graphs captured against them stay valid.
+A NIXL mirror (examples/local_nixl_mirror/nixl_mirror.py) on the same GPU
+holds a byte copy of the memory a READY MX source registered: the weights in
+their final, processed layout, at the source's addresses. Every replica
+restored from one CRIU snapshot has the same weights allocations at the same
+addresses, so on a reload each weights allocation whose address and size
+match a mirror region gets that region mapped behind its address in place of
+its own memory. Nothing is loaded, copied or processed, tensors keep their
+pointers, and CUDA graphs captured against them stay valid.
+
+The reload follows vLLM's usual order after a level-2 sleep: wake_up(weights)
+(which gives the weights fresh memory and restores the buffers saved at
+sleep), then reload_weights. The engine's own memory is unmapped, not
+released, until every swap succeeded, so a failure maps it back unchanged;
+on success it is released.
 
 What does not match -- an allocation the mirror has no region for, or a
 region the source recreated elsewhere -- is finished by tensor name from the
@@ -22,9 +28,9 @@ source address it copied, and opens that socket only once its copy is
 complete. A missing socket means no mirror, or one still copying: the
 strategy is skipped, not waited for.
 
-On failure the strategy unmaps what it mapped and asks the mirror to free its
-copy, so the next strategy has room for the engine's own weights; the chain
-then wakes the weights before trying it.
+On failure the strategy restores the engine's own memory and asks the mirror
+to free its copy, so the GPU has room for the KV cache, and the next strategy
+loads the weights.
 """
 
 from __future__ import annotations
@@ -52,16 +58,14 @@ def _query(path: str) -> dict:
 
 
 class LocalMirrorStrategy(LoadStrategy):
-    """Map a local mirror's copy into the engine's sleeping weights."""
+    """Swap a local mirror's copy in behind the engine's weights."""
 
     name = "local_mirror"
     requires = (
-        EngineAdapter.sleeping_weight_allocations,
-        EngineAdapter.map_weight_allocation,
-        EngineAdapter.unmap_weight_allocation,
+        EngineAdapter.weight_allocations,
+        EngineAdapter.swap_weight_allocation,
+        EngineAdapter.restore_weight_allocation,
     )
-    # Maps into the sleeping allocations itself: it must see them asleep.
-    accepts_sleeping_weights = True
 
     # The weights arrive processed, at their own addresses: no layerwise
     # reload to enter or leave, no post-processing, and no registration --
@@ -84,8 +88,10 @@ class LocalMirrorStrategy(LoadStrategy):
             return False
         if not super().is_available(ctx):
             return False
-        if not ctx.adapter.sleeping_weight_allocations():
-            logger.info(f"[Worker {ctx.global_rank}] No sleeping weights, local_mirror skipped")
+        if not ctx.adapter.weight_allocations():
+            logger.info(
+                f"[Worker {ctx.global_rank}] No awake weights allocations, local_mirror skipped"
+            )
             return False
         path = self._socket(ctx)
         try:
@@ -111,7 +117,7 @@ class LocalMirrorStrategy(LoadStrategy):
         path = self._socket(ctx)
         t0 = time.perf_counter()
         stats: dict = {"socket": path}
-        mapped: list = []
+        swapped: list = []  # (token, the engine's own handle)
         mapped_sizes: dict[int, int] = {}
         regions: dict = {}
         try:
@@ -120,46 +126,49 @@ class LocalMirrorStrategy(LoadStrategy):
 
             t = time.perf_counter()
             local_gpu.use_device(ctx.device_id)
+            # Nothing may still be using the memory about to be unmapped.
+            local_gpu.synchronize()
             left = 0
-            for addr, size, token in ctx.adapter.sleeping_weight_allocations():
+            for addr, size, token in ctx.adapter.weight_allocations():
                 region = regions.get(addr)
                 if region is None or region[0] != size or region[1] < size:
                     left += 1
                     continue
                 handle = local_gpu.import_fd(region[2])
                 try:
-                    ctx.adapter.map_weight_allocation(token, handle)
+                    own = ctx.adapter.swap_weight_allocation(token, handle)
                 except BaseException:
                     local_gpu.release(handle)
                     raise
-                mapped.append(token)
+                swapped.append((token, own))
                 mapped_sizes[addr] = size
             local_gpu.synchronize()
             pending = {a: r for a, r in regions.items() if a not in mapped_sizes}
             stats.update(
-                mapped=len(mapped),
-                mapped_bytes=sum(mapped_sizes.values()),
-                weights_left_asleep=left,
+                swapped=len(swapped),
+                swapped_bytes=sum(mapped_sizes.values()),
+                unmatched_allocations=left,
                 unmatched_regions=len(pending),
-                map_s=round(time.perf_counter() - t, 3),
+                swap_s=round(time.perf_counter() - t, 3),
             )
 
             if left or pending:
-                # The finish writes into allocations that were not mapped, so
-                # they need their own memory first.
-                if left:
-                    ctx.adapter.wake_sleeping_weights()
+                # Unmatched allocations keep the engine's own memory, which
+                # the finish writes into.
                 stats.update(
                     finish_by_name(
                         result.model, ctx, header["source_agent"], mapped_sizes, pending
                     )
                 )
         except Exception as e:
-            for token in mapped:
+            for token, own in reversed(swapped):
                 try:
-                    ctx.adapter.unmap_weight_allocation(token)
+                    ctx.adapter.restore_weight_allocation(token, own)
                 except Exception as undo:
-                    logger.warning(f"[Worker {ctx.global_rank}] Unmapping failed: {undo}")
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Restoring a weights allocation "
+                        f"failed: {undo}"
+                    )
             try:
                 release_mirror(path)
             except OSError as release_error:
@@ -172,6 +181,9 @@ class LocalMirrorStrategy(LoadStrategy):
             for *_, fd in regions.values():
                 os.close(fd)
 
+        # The swap is final: free the engine's own copy.
+        for _, own in swapped:
+            local_gpu.release(own)
         stats["total_s"] = round(time.perf_counter() - t0, 3)
         logger.info(f"[Worker {ctx.global_rank}] [TIMING] local_mirror: {stats}")
         _record(ctx, stats)

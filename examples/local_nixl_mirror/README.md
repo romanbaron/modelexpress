@@ -54,39 +54,40 @@ ordinal.
 The strategy only runs when all of these are true:
 
 - the load is a reload;
-- the engine has weights allocations that are asleep;
+- every weights allocation of the engine has memory (the engine woke them);
 - the mirror answers from the same GPU UUID with a non-empty copy.
 
-Each sleeping allocation whose address and size match a mirror region gets
-that region's FD imported and mapped at its reserved address. Anything left
-over is finished by tensor name from the mirror's copy:
+Each weights allocation whose address and size match a mirror region gets
+that region's FD imported and mapped behind its address, in place of the
+engine's own memory. Anything left over is finished by tensor name from the
+mirror's copy:
 
-- allocations without a matching region are woken and written;
+- allocations without a matching region keep their own memory and are
+  written;
 - regions without a matching allocation are copied by name.
 
-On failure, the strategy:
+The engine's own memory is only unmapped during the swap. It is released
+once everything succeeded. On failure, the strategy:
 
-1. unmaps what it mapped;
-2. asks the mirror to release its copy, so the engine has room for its own
-   weights;
-3. raises `StrategyFailed(mutated=False)`.
-
-Before trying any later strategy in the chain, the chain wakes the sleeping
-weights (`EngineAdapter.wake_sleeping_weights`). Only a strategy with
-`accepts_sleeping_weights = True` sees them asleep.
+1. maps the engine's own memory back, unchanged;
+2. asks the mirror to release its copy, so the GPU has room for the KV cache;
+3. raises `StrategyFailed(mutated=False)`, and the next strategy loads the
+   weights.
 
 ## vLLM requirements
 
-- Sleep mode must be on (`CuMemAllocator`), and the reload must follow a
-  level-2 sleep: `reload_weights` runs before `wake_up(tags=["weights"])`.
-  This order lets the mirror's memory replace the weights instead of sitting
-  next to a woken copy.
-- If a later strategy runs a layerwise reload, the buffers that the worker
-  saved at sleep must be restored before the weights are woken. The adapter
-  therefore calls `CuMemAllocator.wake_weights_hook` when the worker sets it,
-  and the worker sets it to `lambda: self.wake_up(tags=["weights"])`.
-  Without the hook, the allocator alone wakes the weights. The weights then
-  have memory again, but the saved buffers stay unrestored.
+- Sleep mode must be on (`CuMemAllocator`). The strategy reads its records
+  (`pointer_to_data`, the `(device, size, address, p_handle)` handle) and
+  rewrites the handle slot, so a later sleep or free releases the mirror's
+  memory like the engine's own.
+- The reload follows vLLM's usual order after a level-2 sleep:
+  `wake_up(tags=["weights"])`, then `reload_weights`, then
+  `wake_up(tags=["kv_cache"])`. The weights wake restores the buffers saved at
+  sleep, so any strategy, including a fallback, reloads the weights over
+  correct buffers.
+- Memory: between the weights wake and the swap, the GPU holds the engine's
+  fresh weights and the mirror's copy, about twice the weights. The KV cache
+  must stay asleep until after the reload, which frees the engine's copy.
 
 ## Usage
 

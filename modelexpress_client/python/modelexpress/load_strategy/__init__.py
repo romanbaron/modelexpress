@@ -166,14 +166,6 @@ def execute_load_strategies(
 
         for strategy in eligible:
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
-            # A reload can start with the weights asleep; only a strategy that
-            # maps memory into them itself may see them that way.
-            if (
-                ctx.is_reload
-                and not strategy.accepts_sleeping_weights
-                and ctx.adapter is not None
-            ):
-                ctx.adapter.wake_sleeping_weights()
             try:
                 with _strategy_phases(strategy, result, ctx):
                     result = strategy.load(result, ctx)

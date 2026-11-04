@@ -91,7 +91,7 @@ if TYPE_CHECKING:
     MX_MS_DISTRIBUTED: bool
     # InstantTensor loader
     MX_INSTANT_TENSOR: bool
-    # Local NIXL mirror (reload of sleeping weights: local_mirror strategy)
+    # Local NIXL mirror (reload: local_mirror strategy)
     MX_LOCAL_MIRROR_RELOAD_SOCKET: Optional[str]
     # TRT-LLM live transfer
     MX_SOURCE_QUERY_TIMEOUT: int
@@ -318,7 +318,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_INSTANT_TENSOR", "1").lower() in ("1", "true")
     ),
     # ── Local NIXL mirror ───────────────────────────────────────────────────
-    # Unix socket of the NIXL mirror on this GPU that a reload maps sleeping
+    # Unix socket of the NIXL mirror on this GPU that a reload swaps the
     # weights from (local_mirror strategy), {rank} replaced by the local GPU
     # ordinal, e.g. /tmp/mx-local-mirror-{rank}.sock. Unset disables it. Not
     # waited for: a mirror still copying is skipped and the chain goes on.
