@@ -97,7 +97,12 @@ class LocalMirrorStrategy(LoadStrategy):
         except OSError as e:
             logger.info(f"[Worker {ctx.global_rank}] No local mirror at {path} ({e}), skipped")
             return False
-        if msg.get("gpu_uuid") != local_gpu.gpu_uuid(ctx.device_id):
+        try:
+            uuid = local_gpu.gpu_uuid(ctx.device_id)
+        except ImportError as e:
+            logger.info(f"[Worker {ctx.global_rank}] cuda-python unavailable ({e}), skipped")
+            return False
+        if msg.get("gpu_uuid") != uuid:
             logger.warning(
                 f"[Worker {ctx.global_rank}] Local mirror at {path} is on "
                 f"{msg.get('gpu_uuid')}, not on this GPU; skipped"
@@ -109,6 +114,8 @@ class LocalMirrorStrategy(LoadStrategy):
         return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        import torch
+
         from ..local_mirror import _receive_regions, finish_by_name, release_mirror
 
         result = _as_load_result(result)
@@ -123,9 +130,9 @@ class LocalMirrorStrategy(LoadStrategy):
             stats["receive_s"] = round(time.perf_counter() - t0, 3)
 
             t = time.perf_counter()
-            local_gpu.use_device(ctx.device_id)
+            torch.cuda.set_device(ctx.device_id)
             # Nothing may still be using the memory about to be unmapped.
-            local_gpu.synchronize()
+            torch.cuda.synchronize(ctx.device_id)
             # Each region was copied from a source allocation of the same
             # address and size; it is swapped in where the engine has an awake
             # weights allocation exactly there.
@@ -136,7 +143,7 @@ class LocalMirrorStrategy(LoadStrategy):
                 if swap is not None:
                     swapped.append(swap)
                     mapped_sizes[addr] = size
-            local_gpu.synchronize()
+            torch.cuda.synchronize(ctx.device_id)
             pending = {a: r for a, r in regions.items() if a not in mapped_sizes}
             stats.update(
                 swapped=len(swapped),

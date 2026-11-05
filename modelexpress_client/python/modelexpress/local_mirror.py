@@ -159,7 +159,7 @@ def finish_by_name(
             raise LookupError(f"{name} at 0x{src:x} is in no mirror region")
         copies.append((name, dst, src, nbytes, region))
 
-    local_gpu.use_device(device)
+    torch.cuda.set_device(device)
     temp = {}  # pending region -> (va, allocation_size, handle)
     try:
         for *_, region in copies:
@@ -178,10 +178,10 @@ def finish_by_name(
                 local_gpu.copy(base + offset, va, nbytes)
                 placed.append((dst, offset, nbytes))
                 offset += nbytes
-            local_gpu.synchronize()
+            torch.cuda.synchronize(device)
             for dst, off, nbytes in placed:
                 local_gpu.copy(dst, base + off, nbytes)
-            local_gpu.synchronize()
+            torch.cuda.synchronize(device)
             del staging
     finally:
         for va, allocation_size, handle in temp.values():

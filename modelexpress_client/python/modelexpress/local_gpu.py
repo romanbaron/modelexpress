@@ -3,10 +3,12 @@
 
 """Share GPU memory between processes on the same GPU through cuMem POSIX FDs.
 
-Used by the NIXL mirror (exporting side, examples/local_nixl_mirror/nixl_mirror.py) and
-inside the engine by the local_mirror load strategy and local_mirror.py
-(importing side). Calls libcuda directly through ctypes on the device's
-primary context, the same context the engine's CUDA runtime made current.
+Used by the NIXL mirror (exporting side, examples/local_nixl_mirror/nixl_mirror.py)
+and inside the engine by the local_mirror load strategy and local_mirror.py
+(importing side). PyTorch exposes none of the cuMem VMM calls this needs
+(exportable allocations, FD export/import, mapping at a given address), so
+they go through cuda-python's driver bindings, as vmm/backend.py does. The
+mirror does not import torch; the engine side uses torch for everything else.
 
 Messages are AF_UNIX SOCK_SEQPACKET, one JSON object per message (split into
 fragments, since a datagram cannot exceed the socket buffer), with up to
@@ -16,7 +18,6 @@ described in nixl_mirror.serve_local.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import socket
 from typing import Any
@@ -26,226 +27,134 @@ MAX_FDS_PER_MSG = 250
 # Fragment payload, well under the default unix socket buffer.
 _FRAGMENT_BYTES = 60_000
 
-CU_MEM_ALLOCATION_TYPE_PINNED = 1
-CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1
-CU_MEM_LOCATION_TYPE_DEVICE = 1
-CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+_driver: Any = None
+_primary_contexts: dict[int, Any] = {}
 
 
-class _CUmemLocation(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+def _cu():
+    """cuda-python's driver module, initialized. Raises ImportError when
+    cuda-python is not installed."""
+    global _driver
+    if _driver is None:
+        from cuda.bindings import driver
 
-
-class _CUmemAllocFlags(ctypes.Structure):
-    _fields_ = [
-        ("compressionType", ctypes.c_ubyte),
-        ("gpuDirectRDMACapable", ctypes.c_ubyte),
-        ("usage", ctypes.c_ushort),
-        ("reserved", ctypes.c_ubyte * 4),
-    ]
-
-
-class _CUmemAllocationProp(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("requestedHandleTypes", ctypes.c_int),
-        ("location", _CUmemLocation),
-        ("win32HandleMetaData", ctypes.c_void_p),
-        ("allocFlags", _CUmemAllocFlags),
-    ]
-
-
-class _CUmemAccessDesc(ctypes.Structure):
-    _fields_ = [("location", _CUmemLocation), ("flags", ctypes.c_int)]
-
-
-_libcuda: ctypes.CDLL | None = None
-_primary_contexts: dict[int, ctypes.c_void_p] = {}
-
-
-def _cu() -> ctypes.CDLL:
-    global _libcuda
-    if _libcuda is None:
         # Published only after cuInit returns: another thread that sees it
         # set must not call into the driver before it is initialized.
-        lib = ctypes.CDLL("libcuda.so.1")
-        _check_rc(lib, "cuInit", lib.cuInit(0))
-        _libcuda = lib
-    return _libcuda
+        _check("cuInit", driver.cuInit(0), driver)
+        _driver = driver
+    return _driver
 
 
-def _check(name: str, *args: Any) -> None:
-    lib = _cu()
-    _check_rc(lib, name, getattr(lib, name)(*args))
+def _check(name: str, result: tuple, driver: Any = None) -> Any:
+    """Raise RuntimeError on a failed driver call; return its value, if any."""
+    cu = driver or _driver
+    err, *values = result
+    if err != cu.CUresult.CUDA_SUCCESS:
+        _, text = cu.cuGetErrorString(err)
+        detail = text.decode() if isinstance(text, bytes) else str(text)
+        raise RuntimeError(f"{name} failed: {int(err)} {detail}")
+    return values[0] if values else None
 
 
-def _check_rc(lib: ctypes.CDLL, name: str, rc: int) -> None:
-    if rc != 0:
-        err = ctypes.c_char_p()
-        lib.cuGetErrorString(rc, ctypes.byref(err))
-        raise RuntimeError(f"{name} failed: {rc} {(err.value or b'').decode()}")
-
-
-def device_count() -> int:
-    count = ctypes.c_int()
-    _check("cuDeviceGetCount", ctypes.byref(count))
-    return count.value
+def _call(name: str, *args: Any) -> Any:
+    cu = _cu()
+    return _check(name, getattr(cu, name)(*args))
 
 
 def gpu_uuid(ordinal: int) -> str:
-    dev = ctypes.c_int()
-    _check("cuDeviceGet", ctypes.byref(dev), ordinal)
-    raw = (ctypes.c_ubyte * 16)()
-    _check("cuDeviceGetUuid", raw, dev)
+    dev = _call("cuDeviceGet", ordinal)
+    raw = _call("cuDeviceGetUuid", dev).bytes
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1")
     h = bytes(raw).hex()
     return f"GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
 
 
-def ordinal_for_uuid(uuid: str) -> int:
-    for ordinal in range(device_count()):
-        if gpu_uuid(ordinal) == uuid:
-            return ordinal
-    raise RuntimeError(f"GPU {uuid} is not visible to this process")
-
-
 def use_device(ordinal: int) -> None:
-    """Make the device's primary context current on this thread."""
+    """Make the device's primary context current on this thread (the
+    context the CUDA runtime, and so torch, uses)."""
     ctx = _primary_contexts.get(ordinal)
     if ctx is None:
-        dev = ctypes.c_int()
-        _check("cuDeviceGet", ctypes.byref(dev), ordinal)
-        ctx = ctypes.c_void_p()
-        _check("cuDevicePrimaryCtxRetain", ctypes.byref(ctx), dev)
+        dev = _call("cuDeviceGet", ordinal)
+        ctx = _call("cuDevicePrimaryCtxRetain", dev)
         _primary_contexts[ordinal] = ctx
-    _check("cuCtxSetCurrent", ctx)
+    _call("cuCtxSetCurrent", ctx)
 
 
 def create(ordinal: int, size: int) -> int:
     """Allocate exportable physical memory; size must be granularity-aligned."""
-    prop = _CUmemAllocationProp()
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+    cu = _cu()
+    prop = cu.CUmemAllocationProp()
+    prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.requestedHandleTypes = (
+        cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    )
+    prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
     prop.location.id = ordinal
     # Matches vLLM's cumem allocator, so the memory can be registered with a NIC.
     prop.allocFlags.gpuDirectRDMACapable = 1
-    handle = ctypes.c_uint64()
-    _check(
-        "cuMemCreate",
-        ctypes.byref(handle),
-        ctypes.c_size_t(size),
-        ctypes.byref(prop),
-        ctypes.c_uint64(0),
-    )
-    return handle.value
+    return int(_call("cuMemCreate", size, prop, 0))
 
 
 def export_fd(handle: int) -> int:
-    fd = ctypes.c_int()
-    _check(
+    cu = _cu()
+    fd = _call(
         "cuMemExportToShareableHandle",
-        ctypes.byref(fd),
-        ctypes.c_uint64(handle),
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-        ctypes.c_uint64(0),
+        handle,
+        cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+        0,
     )
-    return fd.value
+    return int(fd)
 
 
 def import_fd(fd: int) -> int:
-    handle = ctypes.c_uint64()
-    _check(
+    cu = _cu()
+    handle = _call(
         "cuMemImportFromShareableHandle",
-        ctypes.byref(handle),
-        ctypes.c_void_p(fd),
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+        fd,
+        cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
     )
-    return handle.value
+    return int(handle)
 
 
 def release(handle: int) -> None:
-    _check("cuMemRelease", ctypes.c_uint64(handle))
+    _call("cuMemRelease", handle)
 
 
 def retain_handle(va: int) -> int | None:
-    """A new reference to the cuMem allocation mapped at `va`, or None when
-    no cuMem allocation is mapped there. Release it like any handle."""
-    handle = ctypes.c_uint64()
-    rc = _cu().cuMemRetainAllocationHandle(ctypes.byref(handle), ctypes.c_void_p(va))
-    return handle.value if rc == 0 else None
+    """A new reference to the cuMem allocation mapped at `va` (the same
+    handle value it was mapped with), or None when no cuMem allocation is
+    mapped there. Release it like any handle."""
+    cu = _cu()
+    err, handle = cu.cuMemRetainAllocationHandle(va)
+    return int(handle) if err == cu.CUresult.CUDA_SUCCESS else None
 
 
 def reserve(size: int) -> int:
-    va = ctypes.c_uint64()
-    _check(
-        "cuMemAddressReserve",
-        ctypes.byref(va),
-        ctypes.c_size_t(size),
-        ctypes.c_size_t(0),
-        ctypes.c_uint64(0),
-        ctypes.c_uint64(0),
-    )
-    return va.value
+    return int(_call("cuMemAddressReserve", size, 0, 0, 0))
 
 
 def address_free(va: int, size: int) -> None:
-    _check("cuMemAddressFree", ctypes.c_uint64(va), ctypes.c_size_t(size))
+    _call("cuMemAddressFree", va, size)
 
 
 def map_at(va: int, size: int, handle: int, ordinal: int) -> None:
-    _check(
-        "cuMemMap",
-        ctypes.c_uint64(va),
-        ctypes.c_size_t(size),
-        ctypes.c_size_t(0),
-        ctypes.c_uint64(handle),
-        ctypes.c_uint64(0),
-    )
-    desc = _CUmemAccessDesc()
-    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE
-    desc.location.id = ordinal
-    desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-    _check(
-        "cuMemSetAccess",
-        ctypes.c_uint64(va),
-        ctypes.c_size_t(size),
-        ctypes.byref(desc),
-        ctypes.c_size_t(1),
-    )
+    cu = _cu()
+    _call("cuMemMap", va, size, 0, handle, 0)
+    access = cu.CUmemAccessDesc()
+    access.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    access.location.id = ordinal
+    access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+    _call("cuMemSetAccess", va, size, [access], 1)
 
 
 def unmap(va: int, size: int) -> None:
-    _check("cuMemUnmap", ctypes.c_uint64(va), ctypes.c_size_t(size))
-
-
-def memset_u32(va: int, value: int, size: int) -> None:
-    _check(
-        "cuMemsetD32_v2",
-        ctypes.c_uint64(va),
-        ctypes.c_uint(value),
-        ctypes.c_size_t(size // 4),
-    )
-
-
-def synchronize() -> None:
-    _check("cuCtxSynchronize")
-
-
-def read(va: int, nbytes: int) -> bytes:
-    buf = ctypes.create_string_buffer(nbytes)
-    _check("cuMemcpyDtoH_v2", buf, ctypes.c_uint64(va), ctypes.c_size_t(nbytes))
-    return buf.raw
-
-
-def write(va: int, data: bytes) -> None:
-    _check("cuMemcpyHtoD_v2", ctypes.c_uint64(va), data, ctypes.c_size_t(len(data)))
+    _call("cuMemUnmap", va, size)
 
 
 def copy(dst: int, src: int, nbytes: int) -> None:
-    """Device-to-device copy within the current context."""
-    _check(
-        "cuMemcpyDtoD_v2", ctypes.c_uint64(dst), ctypes.c_uint64(src), ctypes.c_size_t(nbytes)
-    )
+    """Device-to-device copy between raw addresses, in the current context."""
+    _call("cuMemcpyDtoD", dst, src, nbytes)
 
 
 def send_msg(sock: socket.socket, msg: dict, fds: list[int] | tuple = ()) -> None:

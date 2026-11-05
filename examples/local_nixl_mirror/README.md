@@ -29,9 +29,11 @@ bytes each allocation needs, at a matching address and size.
   each mirror with `CUDA_VISIBLE_DEVICES` set to its own GPU. If any mirror
   exits, it stops the rest.
 
-`nixl_mirror.py` uses `modelexpress.local_gpu`, which is ctypes over the CUDA
-driver, so it doesn't need torch. It also works with a standalone copy of
-`local_gpu.py` placed next to it.
+`nixl_mirror.py` uses `modelexpress.local_gpu`, which calls the CUDA driver
+through cuda-python (`cuda.bindings.driver`, as `modelexpress/vmm` does), so
+the mirror needs cuda-python and NIXL but not torch. It also works with a
+standalone copy of `local_gpu.py` placed next to it. On the engine side, the
+`local_mirror` strategy is skipped when cuda-python is not installed.
 
 ## Socket protocol
 
