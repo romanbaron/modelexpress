@@ -373,8 +373,8 @@ class LocalMirrorStrategy(LoadStrategy):
     """Swap a local mirror's copy in behind the engine's weights."""
 
     name = "local_mirror"
-    # The connection to the mirror, opened by is_available and used and
-    # closed by load.
+    # The connection to the mirror: opened by is_available, used by load.
+    # The chain builds a new strategy for every load, so it lives for one.
     _sock: socket.socket | None = None
     # The weights arrive processed, at their own addresses: no layerwise
     # reload to enter or leave, no post-processing, and no registration --
@@ -397,19 +397,16 @@ class LocalMirrorStrategy(LoadStrategy):
             return False
         if not super().is_available(ctx):
             return False
-        path = self._socket(ctx)
-        self._disconnect()
-        try:
-            self._sock = _connect(path)
-        except OSError as e:
-            logger.info(f"[Worker {ctx.global_rank}] No local mirror at {path} ({e}), skipped")
-            return False
+        if self._sock is None:
+            path = self._socket(ctx)
+            try:
+                self._sock = _connect(path)
+            except OSError as e:
+                logger.info(
+                    f"[Worker {ctx.global_rank}] No local mirror at {path} ({e}), skipped"
+                )
+                return False
         return True
-
-    def _disconnect(self) -> None:
-        if self._sock is not None:
-            self._sock.close()
-            self._sock = None
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
@@ -421,7 +418,7 @@ class LocalMirrorStrategy(LoadStrategy):
         regions: dict = {}
         try:
             if self._sock is None:
-                self._sock = _connect(path)
+                raise RuntimeError("not connected to the mirror (is_available did not run)")
             header, regions = _receive_regions(self._sock)
             stats["receive_s"] = round(time.perf_counter() - t0, 3)
 
@@ -480,7 +477,10 @@ class LocalMirrorStrategy(LoadStrategy):
         finally:
             for *_, fd in regions.values():
                 os.close(fd)
-            self._disconnect()
+            # Done with the mirror; it serves one client at a time.
+            if self._sock is not None:
+                self._sock.close()
+                self._sock = None
 
         # The swap is final: free the engine's own memory. retain_handle gave
         # back the very handle the engine created it with, so releasing it
