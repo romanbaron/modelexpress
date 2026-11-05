@@ -22,17 +22,14 @@ Usage: nixl_mirror.py --endpoint IP:PORT [--gpu N] [--nixl-port PORT] [--socket 
 """
 
 import argparse
+import json
 import os
 import socket
 import struct
 import time
 import uuid
+from typing import Any
 
-try:
-    # Shipped next to this script (a container without the client package).
-    import local_gpu
-except ImportError:
-    from modelexpress import local_gpu
 from nixl._api import nixl_agent, nixl_agent_config
 
 # cuMem allocations are multiples of this.
@@ -40,6 +37,149 @@ GRANULARITY = 2 << 20
 # nixl_mem_t, in enum order.
 MEM_TYPES = ["DRAM", "VRAM", "BLK", "OBJ", "FILE"]
 GPU = 0
+
+
+# --- CUDA driver (cuda-python) and socket messages ------------------------
+# The same calls and framing as the local_mirror strategy's, kept here so the
+# mirror needs neither torch nor the client package.
+
+# SCM_RIGHTS caps one message at 253 FDs.
+MAX_FDS_PER_MSG = 250
+# Fragment payload, well under the default unix socket buffer.
+_FRAGMENT_BYTES = 60_000
+
+_driver: Any = None
+_primary_contexts: dict[int, Any] = {}
+
+
+def _cu():
+    """cuda-python's driver module, initialized. Raises ImportError when
+    cuda-python is not installed."""
+    global _driver
+    if _driver is None:
+        from cuda.bindings import driver
+
+        # Published only after cuInit returns: another thread that sees it
+        # set must not call into the driver before it is initialized.
+        _check("cuInit", driver.cuInit(0), driver)
+        _driver = driver
+    return _driver
+
+
+def _check(name: str, result: tuple, driver: Any = None) -> Any:
+    """Raise RuntimeError on a failed driver call; return its value, if any."""
+    cu = driver or _driver
+    err, *values = result
+    if err != cu.CUresult.CUDA_SUCCESS:
+        _, text = cu.cuGetErrorString(err)
+        detail = text.decode() if isinstance(text, bytes) else str(text)
+        raise RuntimeError(f"{name} failed: {int(err)} {detail}")
+    return values[0] if values else None
+
+
+def _call(name: str, *args: Any) -> Any:
+    cu = _cu()
+    return _check(name, getattr(cu, name)(*args))
+
+
+def cu_gpu_uuid(ordinal: int) -> str:
+    dev = _call("cuDeviceGet", ordinal)
+    raw = _call("cuDeviceGetUuid", dev).bytes
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1")
+    h = bytes(raw).hex()
+    return f"GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+
+def cu_use_device(ordinal: int) -> None:
+    """Make the device's primary context current on this thread (the
+    context the CUDA runtime, and so torch, uses)."""
+    ctx = _primary_contexts.get(ordinal)
+    if ctx is None:
+        dev = _call("cuDeviceGet", ordinal)
+        ctx = _call("cuDevicePrimaryCtxRetain", dev)
+        _primary_contexts[ordinal] = ctx
+    _call("cuCtxSetCurrent", ctx)
+
+
+def cu_create(ordinal: int, size: int) -> int:
+    """Allocate exportable physical memory; size must be granularity-aligned."""
+    cu = _cu()
+    prop = cu.CUmemAllocationProp()
+    prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.requestedHandleTypes = (
+        cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    )
+    prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = ordinal
+    # Matches vLLM's cumem allocator, so the memory can be registered with a NIC.
+    prop.allocFlags.gpuDirectRDMACapable = 1
+    return int(_call("cuMemCreate", size, prop, 0))
+
+
+def cu_export_fd(handle: int) -> int:
+    cu = _cu()
+    fd = _call(
+        "cuMemExportToShareableHandle",
+        handle,
+        cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+        0,
+    )
+    return int(fd)
+
+
+def cu_release(handle: int) -> None:
+    _call("cuMemRelease", handle)
+
+
+def cu_reserve(size: int) -> int:
+    return int(_call("cuMemAddressReserve", size, 0, 0, 0))
+
+
+def cu_address_free(va: int, size: int) -> None:
+    _call("cuMemAddressFree", va, size)
+
+
+def cu_map_at(va: int, size: int, handle: int, ordinal: int) -> None:
+    cu = _cu()
+    _call("cuMemMap", va, size, 0, handle, 0)
+    access = cu.CUmemAccessDesc()
+    access.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    access.location.id = ordinal
+    access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+    _call("cuMemSetAccess", va, size, [access], 1)
+
+
+def cu_unmap(va: int, size: int) -> None:
+    _call("cuMemUnmap", va, size)
+
+
+def send_msg(sock: socket.socket, msg: dict, fds: list[int] | tuple = ()) -> None:
+    """Send one message; the FDs ride on its first fragment.
+
+    Each fragment starts with a byte that is 1 when more fragments follow.
+    """
+    payload = json.dumps(msg).encode()
+    chunks = [
+        payload[i : i + _FRAGMENT_BYTES]
+        for i in range(0, len(payload), _FRAGMENT_BYTES)
+    ]
+    for i, chunk in enumerate(chunks):
+        more = b"\x01" if i + 1 < len(chunks) else b"\x00"
+        socket.send_fds(sock, [more + chunk], list(fds) if i == 0 else [])
+
+
+def recv_msg(sock: socket.socket, maxfds: int = 0) -> tuple[dict, list[int]]:
+    parts: list[bytes] = []
+    all_fds: list[int] = []
+    while True:
+        data, fds, _, _ = socket.recv_fds(sock, _FRAGMENT_BYTES + 1, maxfds)
+        if not data:
+            raise ConnectionError("peer closed the local GPU socket")
+        all_fds.extend(fds)
+        parts.append(data[1:])
+        if data[:1] == b"\x00":
+            return json.loads(b"".join(parts)), all_fds
 
 
 def log(msg):
@@ -167,11 +307,11 @@ def allocate(sizes):
     Returns [(va, handle)] and the (base, span) of the range."""
     sizes = [aligned(s) for s in sizes]
     span = sum(sizes)
-    base = local_gpu.reserve(span)
+    base = cu_reserve(span)
     local, off = [], 0
     for size in sizes:
-        handle = local_gpu.create(GPU, size)
-        local_gpu.map_at(base + off, size, handle, GPU)
+        handle = cu_create(GPU, size)
+        cu_map_at(base + off, size, handle, GPU)
         local.append((base + off, handle))
         off += size
     return local, base, span
@@ -190,7 +330,7 @@ def copy(host, port, nixl_port):
         f"{total / 2**20:.0f} MiB")
 
     t0 = time.perf_counter()
-    local_gpu.use_device(GPU)
+    cu_use_device(GPU)
     name = f"mirror{GPU}-{uuid.uuid4().hex[:8]}"
     agent = nixl_agent(
         name, nixl_agent_config(backends=["UCX"], enable_listen_thread=True, listen_port=nixl_port)
@@ -242,9 +382,9 @@ def copy(host, port, nixl_port):
         Memory a client imported stays valid until that client releases it."""
         agent.deregister_memory(registration)
         for (va, handle), (_, size, _) in zip(local, regions):
-            local_gpu.unmap(va, aligned(size))
-            local_gpu.release(handle)
-        local_gpu.address_free(base, span)
+            cu_unmap(va, aligned(size))
+            cu_release(handle)
+        cu_address_free(base, span)
 
     return source_agent, agent, copied, release
 
@@ -262,19 +402,19 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
     running, holding nothing: memory_bytes is 0 and regions get {"error"}.
     {"want": "regions"} gets messages {"source_agent",
     "source_endpoint", "gpu_uuid", "batch": [[source_addr, size,
-    allocation_size], ...], "last"} with one FD per batch entry (local_gpu
+    allocation_size], ...], "last"} with one FD per batch entry (send_msg
     framing, at most MAX_FDS_PER_MSG FDs a message). The client owns the FDs
     it receives; the mirror keeps its own handles and mappings, so the memory
     stays valid for both.
 
     regions: [(source_addr, size, handle)]; release: frees them.
     """
-    gpu_uuid = local_gpu.gpu_uuid(GPU)
+    gpu_uuid = cu_gpu_uuid(GPU)
     memory_bytes = sum(aligned(size) for _, size, _ in regions)
     # Exported once, before any client asks: sending dups them (SCM_RIGHTS),
     # so the same FDs serve every client.
-    fds = [local_gpu.export_fd(handle) for _, _, handle in regions]
-    step = local_gpu.MAX_FDS_PER_MSG
+    fds = [cu_export_fd(handle) for _, _, handle in regions]
+    step = MAX_FDS_PER_MSG
 
     if os.path.exists(path):
         os.unlink(path)
@@ -286,9 +426,9 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
         conn, _ = server.accept()
         try:
             with conn:
-                request, _ = local_gpu.recv_msg(conn)
+                request, _ = recv_msg(conn)
                 if request.get("want") == "memory":
-                    local_gpu.send_msg(conn, {"memory_bytes": memory_bytes, "gpu_uuid": gpu_uuid})
+                    send_msg(conn, {"memory_bytes": memory_bytes, "gpu_uuid": gpu_uuid})
                     continue
                 if request.get("want") == "release":
                     released = memory_bytes
@@ -298,13 +438,13 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
                         release()
                         regions, fds, memory_bytes = [], [], 0
                         log(f"released the copy ({released / 2**30:.2f} GiB) on request")
-                    local_gpu.send_msg(conn, {"released": released})
+                    send_msg(conn, {"released": released})
                     continue
                 if not regions:
-                    local_gpu.send_msg(conn, {"error": "the copy was released"})
+                    send_msg(conn, {"error": "the copy was released"})
                     continue
                 for i in range(0, len(regions), step):
-                    local_gpu.send_msg(conn, {
+                    send_msg(conn, {
                         "source_agent": source_agent,
                         "source_endpoint": source_endpoint,
                         "gpu_uuid": gpu_uuid,
