@@ -106,15 +106,6 @@ def _call(name: str, *args: Any) -> Any:
     return _check(name, getattr(cu, name)(*args))
 
 
-def _gpu_uuid(ordinal: int) -> str:
-    dev = _call("cuDeviceGet", ordinal)
-    raw = _call("cuDeviceGetUuid", dev).bytes
-    if isinstance(raw, str):
-        raw = raw.encode("latin-1")
-    h = bytes(raw).hex()
-    return f"GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
-
-
 def _import_fd(fd: int) -> int:
     cu = _cu()
     handle = _call(
@@ -199,7 +190,7 @@ def _recv_msg(sock: socket.socket, maxfds: int = 0) -> tuple[dict, list[int]]:
 # --- Mirror client -------------------------------------------------------------
 
 
-def _receive_regions(path: str, device: int):
+def _receive_regions(path: str):
     """The mirror's regions as {source_addr: (size, allocation_size, fd)},
     plus its header."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -224,10 +215,6 @@ def _receive_regions(path: str, device: int):
         raise
     finally:
         sock.close()
-    if msg["gpu_uuid"] != _gpu_uuid(device):
-        for *_, fd in regions.values():
-            os.close(fd)
-        raise RuntimeError(f"mirror is on {msg['gpu_uuid']}, not on this GPU")
     return msg, regions
 
 
@@ -425,7 +412,7 @@ class LocalMirrorStrategy(LoadStrategy):
         mapped_sizes: dict[int, int] = {}
         regions: dict = {}
         try:
-            header, regions = _receive_regions(path, ctx.device_id)
+            header, regions = _receive_regions(path)
             stats["receive_s"] = round(time.perf_counter() - t0, 3)
 
             t = time.perf_counter()

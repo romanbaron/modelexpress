@@ -82,15 +82,6 @@ def _call(name: str, *args: Any) -> Any:
     return _check(name, getattr(cu, name)(*args))
 
 
-def cu_gpu_uuid(ordinal: int) -> str:
-    dev = _call("cuDeviceGet", ordinal)
-    raw = _call("cuDeviceGetUuid", dev).bytes
-    if isinstance(raw, str):
-        raw = raw.encode("latin-1")
-    h = bytes(raw).hex()
-    return f"GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
-
-
 def cu_use_device(ordinal: int) -> None:
     """Make the device's primary context current on this thread (the
     context the CUDA runtime, and so torch, uses)."""
@@ -395,13 +386,12 @@ def copy(host, port, nixl_port):
 def serve_local(path, source_agent, source_endpoint, regions, release):
     """Answer local requests on a unix socket, one client at a time, forever.
 
-    {"want": "memory"} gets {"memory_bytes", "gpu_uuid"}: whether the copy is
-    ready (the socket exists only once it is), on which GPU, and how much it
-    holds. {"want": "release"} frees the copy (for a client that cannot use
+    {"want": "memory"} gets {"memory_bytes"}: whether the copy is ready (the
+    socket exists only once it is) and how much it holds. {"want": "release"} frees the copy (for a client that cannot use
     it and needs the memory) and gets {"released": bytes}; the mirror keeps
     running, holding nothing: memory_bytes is 0 and regions get {"error"}.
     {"want": "regions"} gets messages {"source_agent",
-    "source_endpoint", "gpu_uuid", "batch": [[source_addr, size,
+    "source_endpoint", "batch": [[source_addr, size,
     allocation_size], ...], "last"} with one FD per batch entry (send_msg
     framing, at most MAX_FDS_PER_MSG FDs a message). The client owns the FDs
     it receives; the mirror keeps its own handles and mappings, so the memory
@@ -409,7 +399,6 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
 
     regions: [(source_addr, size, handle)]; release: frees them.
     """
-    gpu_uuid = cu_gpu_uuid(GPU)
     memory_bytes = sum(aligned(size) for _, size, _ in regions)
     # Exported once, before any client asks: sending dups them (SCM_RIGHTS),
     # so the same FDs serve every client.
@@ -421,7 +410,7 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
     server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     server.bind(path)
     server.listen()
-    log(f"handing out {len(regions)} regions on {path} ({gpu_uuid})")
+    log(f"handing out {len(regions)} regions on {path}")
     while True:
         conn, _ = server.accept()
         try:
@@ -432,7 +421,7 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
                     # A connection check: closed before sending a request.
                     continue
                 if request.get("want") == "memory":
-                    send_msg(conn, {"memory_bytes": memory_bytes, "gpu_uuid": gpu_uuid})
+                    send_msg(conn, {"memory_bytes": memory_bytes})
                     continue
                 if request.get("want") == "release":
                     released = memory_bytes
@@ -451,7 +440,6 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
                     send_msg(conn, {
                         "source_agent": source_agent,
                         "source_endpoint": source_endpoint,
-                        "gpu_uuid": gpu_uuid,
                         "batch": [[a, s, aligned(s)] for a, s, _ in regions[i:i + step]],
                         "last": i + step >= len(regions),
                     }, fds[i:i + step])
