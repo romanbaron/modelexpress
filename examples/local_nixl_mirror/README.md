@@ -54,17 +54,23 @@ ordinal.
 The strategy only runs when all of these are true:
 
 - the load is a reload;
-- every weights allocation of the engine has memory (the engine woke them);
 - the mirror answers from the same GPU UUID with a non-empty copy.
 
-Each weights allocation whose address and size match a mirror region gets
-that region's FD imported and mapped behind its address, in place of the
-engine's own memory. Anything left over is finished by tensor name from the
-mirror's copy:
+For each mirror region, the strategy imports its FD and asks the engine
+adapter (`swap_weight_allocation(address, size, handle)`) to map it behind
+the engine's weights allocation of the same address and size, in place of
+the engine's own memory. The adapter returns None when the engine has no such
+allocation, and fails when the allocation is asleep (the engine did not wake
+the weights first). If no region matched, the engine is not a replica of the
+mirror's source and the strategy fails.
 
-- allocations without a matching region keep their own memory and are
-  written;
-- regions without a matching allocation are copied by name.
+Everything not in place afterwards is finished by tensor name from the
+mirror's copy, which also checks that every tensor of the engine has its
+source counterpart:
+
+- tensors in allocations without a matching region keep their own memory and
+  are written;
+- tensors in regions without a matching allocation are copied by name.
 
 The engine's own memory is only unmapped during the swap. It is released
 once everything succeeded. On failure, the strategy:

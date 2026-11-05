@@ -209,25 +209,22 @@ class EngineAdapter:
         return None
 
     @gated_capability
-    def weight_allocations(self) -> list[tuple[int, int, Any]]:
-        """(address, size, token) of every weights allocation the engine
-        holds. Empty when any of them is asleep (a level-2 sleep released its
-        memory and the engine has not woken it yet). The token is handed back
-        to swap_weight_allocation / restore_weight_allocation."""
-
-    @gated_capability
-    def swap_weight_allocation(self, token: Any, handle: int) -> int:
+    def swap_weight_allocation(self, address: int, size: int, handle: int) -> int | None:
         """Put the cuMem allocation `handle` (imported by the caller) behind
-        the weights allocation's address in place of the engine's own memory,
-        and make the engine own it: a later sleep or free releases it like
-        memory the engine created. The engine's own memory is unmapped, not
-        released; its handle is returned, for restore_weight_allocation or for
-        the caller to release once the swap is final."""
+        the engine's weights allocation that starts at `address` and is `size`
+        bytes, in place of the engine's own memory, and make the engine own
+        it: a later sleep or free releases it like memory the engine created.
+
+        Returns the engine's own handle, unmapped but not released, for
+        restore_weight_allocation or for the caller to release once the swap
+        is final. Returns None, changing nothing, when the engine has no
+        weights allocation of that address and size. Raises, changing
+        nothing, when it has one but it is asleep (no memory behind it)."""
 
     @gated_capability
-    def restore_weight_allocation(self, token: Any, handle: int) -> None:
-        """Undo swap_weight_allocation: unmap and release the swapped-in
-        memory and map `handle`, the engine's own, back at the address."""
+    def restore_weight_allocation(self, address: int, handle: int) -> None:
+        """Undo swap_weight_allocation at `address`: unmap and release the
+        swapped-in memory and map `handle`, the engine's own, back."""
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""

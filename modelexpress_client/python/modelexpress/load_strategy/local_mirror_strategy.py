@@ -62,7 +62,6 @@ class LocalMirrorStrategy(LoadStrategy):
 
     name = "local_mirror"
     requires = (
-        EngineAdapter.weight_allocations,
         EngineAdapter.swap_weight_allocation,
         EngineAdapter.restore_weight_allocation,
     )
@@ -88,11 +87,6 @@ class LocalMirrorStrategy(LoadStrategy):
             return False
         if not super().is_available(ctx):
             return False
-        if not ctx.adapter.weight_allocations():
-            logger.info(
-                f"[Worker {ctx.global_rank}] No awake weights allocations, local_mirror skipped"
-            )
-            return False
         path = self._socket(ctx)
         try:
             msg = _query(path)
@@ -117,7 +111,7 @@ class LocalMirrorStrategy(LoadStrategy):
         path = self._socket(ctx)
         t0 = time.perf_counter()
         stats: dict = {"socket": path}
-        swapped: list = []  # (token, the engine's own handle)
+        swapped: list = []  # (address, the engine's own handle)
         mapped_sizes: dict[int, int] = {}
         regions: dict = {}
         try:
@@ -128,42 +122,47 @@ class LocalMirrorStrategy(LoadStrategy):
             local_gpu.use_device(ctx.device_id)
             # Nothing may still be using the memory about to be unmapped.
             local_gpu.synchronize()
-            left = 0
-            for addr, size, token in ctx.adapter.weight_allocations():
-                region = regions.get(addr)
-                if region is None or region[0] != size or region[1] < size:
-                    left += 1
+            # Each region was copied from a source allocation of the same
+            # address and size; the adapter swaps it in where the engine has
+            # a weights allocation exactly there.
+            for addr, (size, allocation_size, fd) in regions.items():
+                if allocation_size < size:
                     continue
-                handle = local_gpu.import_fd(region[2])
+                handle = local_gpu.import_fd(fd)
                 try:
-                    own = ctx.adapter.swap_weight_allocation(token, handle)
+                    own = ctx.adapter.swap_weight_allocation(addr, size, handle)
                 except BaseException:
                     local_gpu.release(handle)
                     raise
-                swapped.append((token, own))
+                if own is None:
+                    local_gpu.release(handle)
+                    continue
+                swapped.append((addr, own))
                 mapped_sizes[addr] = size
             local_gpu.synchronize()
             pending = {a: r for a, r in regions.items() if a not in mapped_sizes}
             stats.update(
                 swapped=len(swapped),
                 swapped_bytes=sum(mapped_sizes.values()),
-                unmatched_allocations=left,
                 unmatched_regions=len(pending),
                 swap_s=round(time.perf_counter() - t, 3),
             )
+            if not swapped:
+                # Not a replica of the mirror's source (no allocation at the
+                # source's addresses): another strategy loads faster.
+                raise RuntimeError("no mirror region matches a weights allocation")
 
-            if left or pending:
-                # Unmatched allocations keep the engine's own memory, which
-                # the finish writes into.
-                stats.update(
-                    finish_by_name(
-                        result.model, ctx, header["source_agent"], mapped_sizes, pending
-                    )
-                )
+            # Every tensor not in place -- in a weights allocation the mirror
+            # had no region for, or recreated elsewhere by the source -- is
+            # written from the mirror's copy, by name. This also verifies
+            # that every tensor of the engine has its source counterpart.
+            stats.update(
+                finish_by_name(result.model, ctx, header["source_agent"], mapped_sizes, pending)
+            )
         except Exception as e:
-            for token, own in reversed(swapped):
+            for addr, own in reversed(swapped):
                 try:
-                    ctx.adapter.restore_weight_allocation(token, own)
+                    ctx.adapter.restore_weight_allocation(addr, own)
                 except Exception as undo:
                     logger.warning(
                         f"[Worker {ctx.global_rank}] Restoring a weights allocation "
