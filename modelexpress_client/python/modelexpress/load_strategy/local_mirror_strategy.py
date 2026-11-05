@@ -5,11 +5,10 @@
 
 A NIXL mirror (examples/local_nixl_mirror/nixl_mirror.py) on the same GPU
 holds a byte copy of the memory a READY MX source registered: the weights in
-their final, processed layout, at the source's addresses. Every replica
-restored from one CRIU snapshot has the same weights allocations at the same
-addresses, so on a reload each weights allocation whose address and size
-match a mirror region gets that region mapped behind its address in place of
-its own memory. Nothing is loaded, copied or processed, tensors keep their
+their final, processed layout, at the source's addresses. On a reload, each
+weights allocation of the engine whose address and size match a mirror
+region gets that region mapped behind its address in place of its own
+memory. Nothing is loaded, copied or processed, tensors keep their
 pointers, and CUDA graphs captured against them stay valid.
 
 The reload follows vLLM's usual order after a level-2 sleep: wake_up(weights)
@@ -330,7 +329,6 @@ class LocalMirrorStrategy(LoadStrategy):
             _release(swap.own)
         stats["total_s"] = round(time.perf_counter() - t0, 3)
         logger.info(f"[Worker {ctx.global_rank}] [TIMING] local_mirror: {stats}")
-        _record(ctx, stats)
         # The mirror's own agent serves this memory: nothing to register.
         result.publishable = False
         return result
@@ -386,16 +384,3 @@ def _swap_back(ctx: LoadContext, swap: _Swap) -> None:
     _unmap(swap.address, swap.size)
     _map_at(swap.address, swap.size, swap.own, ctx.device_id)
     _release(swap.own)
-
-
-def _record(ctx: LoadContext, stats: dict) -> None:
-    """Also write the stats next to a snapshot restore's control files, when
-    there is a control directory: a restored process's log may be lost."""
-    directory = os.environ.get("SNAPSHOT_CONTROL_DIR", "/snapshot-control")
-    if not os.path.isdir(directory):
-        return
-    try:
-        with open(os.path.join(directory, f"vllm-restore-mirror-{ctx.global_rank}"), "w") as f:
-            f.write(f"{stats}\n")
-    except OSError:
-        pass
