@@ -415,24 +415,12 @@ class LocalMirrorStrategy(LoadStrategy):
         except OSError as e:
             logger.info(f"[Worker {ctx.global_rank}] No local mirror at {path} ({e}), skipped")
             return False
-        try:
-            uuid = _gpu_uuid(ctx.device_id)
-        except ImportError as e:
-            logger.info(f"[Worker {ctx.global_rank}] cuda-python unavailable ({e}), skipped")
-            return False
-        if msg.get("gpu_uuid") != uuid:
-            logger.warning(
-                f"[Worker {ctx.global_rank}] Local mirror at {path} is on "
-                f"{msg.get('gpu_uuid')}, not on this GPU; skipped"
-            )
-            return False
         if not msg.get("memory_bytes"):
             logger.info(f"[Worker {ctx.global_rank}] Local mirror at {path} holds nothing, skipped")
             return False
         return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
-
         result = _as_load_result(result)
         path = self._socket(ctx)
         t0 = time.perf_counter()

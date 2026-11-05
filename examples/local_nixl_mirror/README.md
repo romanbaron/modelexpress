@@ -33,8 +33,8 @@ bytes each allocation needs, at a matching address and size.
 cuda-python (`cuda.bindings.driver`, as `modelexpress/vmm` does) and needs
 cuda-python and NIXL, but neither torch nor the client package. Its driver
 calls and message framing are a copy of the ones in the `local_mirror`
-strategy module. On the engine side, the strategy is skipped when
-cuda-python is not installed.
+strategy module. On the engine side, the strategy needs
+cuda-python; without it, it fails and the next strategy loads.
 
 ## Socket protocol
 
@@ -57,7 +57,7 @@ ordinal.
 The strategy only runs when all of these are true:
 
 - the load is a reload;
-- the mirror answers from the same GPU UUID with a non-empty copy.
+- the mirror answers and holds a non-empty copy.
 
 For each mirror region whose address has engine memory mapped behind it
 (`cuMemRetainAllocationHandle`), the strategy imports the region's FD,
