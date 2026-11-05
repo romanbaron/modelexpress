@@ -375,13 +375,12 @@ def _finish_by_name(
 # --- Strategy ------------------------------------------------------------------
 
 
-def _query(path: str) -> dict:
+def _check_connection(path: str) -> None:
+    """Raise OSError unless a mirror accepts connections at `path`. The
+    mirror opens its socket only once its copy is complete."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as sock:
         sock.settimeout(10)
         sock.connect(path)
-        _send_msg(sock, {"want": "memory"})
-        msg, _ = _recv_msg(sock)
-    return msg
 
 
 class LocalMirrorStrategy(LoadStrategy):
@@ -411,7 +410,7 @@ class LocalMirrorStrategy(LoadStrategy):
             return False
         path = self._socket(ctx)
         try:
-            _query(path)
+            _check_connection(path)
         except OSError as e:
             logger.info(f"[Worker {ctx.global_rank}] No local mirror at {path} ({e}), skipped")
             return False

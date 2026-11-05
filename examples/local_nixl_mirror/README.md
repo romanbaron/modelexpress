@@ -47,6 +47,8 @@ The socket is a `SOCK_SEQPACKET` unix socket that carries JSON messages
 | `{"want": "regions"}` | Messages `{"source_agent", "source_endpoint", "gpu_uuid", "batch": [[source_addr, size, allocation_size], ...], "last"}`, each with one FD per batch entry attached via `SCM_RIGHTS`. The client owns the FDs it receives. |
 | `{"want": "release"}` | `{"released": bytes}`. The mirror frees its copy and keeps running empty: `memory_bytes` becomes 0 and a later `regions` request gets `{"error"}`. Memory that a client already imported stays valid until that client releases it. |
 
+A connection closed without a request is a connection check (the `local_mirror` strategy uses it to see whether a mirror is there); the mirror ignores it.
+
 ## ModelExpress side
 
 This is the first strategy in the chain. To enable it, set

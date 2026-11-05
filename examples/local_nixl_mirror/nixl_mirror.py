@@ -426,7 +426,11 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
         conn, _ = server.accept()
         try:
             with conn:
-                request, _ = recv_msg(conn)
+                try:
+                    request, _ = recv_msg(conn)
+                except ConnectionError:
+                    # A connection check: closed before sending a request.
+                    continue
                 if request.get("want") == "memory":
                     send_msg(conn, {"memory_bytes": memory_bytes, "gpu_uuid": gpu_uuid})
                     continue
