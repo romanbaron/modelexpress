@@ -69,6 +69,7 @@ class LoadStrategyChain:
         Returns the (possibly re-initialized) model on success.
         Raises RuntimeError if no strategy succeeds.
         """
+        from .local_mirror_strategy import LocalMirrorStrategy
         from .rdma_strategy import RdmaStrategy
         from .server_cache_strategy import ServerCacheStrategy
         from .instant_tensor_strategy import InstantTensorStrategy
@@ -79,6 +80,7 @@ class LoadStrategyChain:
         from ..plugins import get_plugin, initialize_plugins, validate_plugin_names
 
         all_strategies: list[LoadStrategy] = [
+            LocalMirrorStrategy(),
             RdmaStrategy(),
             ServerCacheStrategy(),
             InstantTensorStrategy(),
