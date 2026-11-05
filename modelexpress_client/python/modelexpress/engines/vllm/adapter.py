@@ -310,16 +310,13 @@ class VllmAdapter(EngineAdapter):
 
         return bool(current_platform.is_cuda_alike())
 
-    # Weights allocations: vLLM's CuMemAllocator (sleep mode) keeps one record
-    # per allocation, with handle = (device, size, address, p_handle), p_handle
-    # pointing at the malloc'd CUmemGenericAllocationHandle that its
-    # unmap_and_release (sleep, free) reads. Swapping the memory behind an
-    # address therefore means remapping it and rewriting that slot.
+    def replace_weight_handle(self, address: int, size: int, handle: int) -> int | None:
+        # vLLM's CuMemAllocator (sleep mode) keeps one record per allocation,
+        # keyed by address, with handle = (device, size, address, p_handle).
+        # p_handle points at the malloc'd CUmemGenericAllocationHandle that
+        # unmap_and_release (sleep, free) releases and wake_up overwrites.
+        import ctypes
 
-    @staticmethod
-    def _weights_record(address: int):
-        """The CuMemAllocator record of the weights allocation at `address`,
-        or None."""
         try:
             from vllm.device_allocator.cumem import CuMemAllocator
         except ImportError:
@@ -328,53 +325,19 @@ class VllmAdapter(EngineAdapter):
         if allocator is None:
             return None
         record = allocator.pointer_to_data.get(address)
-        if record is None or record.tag != "weights":
+        if (
+            record is None
+            or record.tag != "weights"
+            or record.is_asleep
+            or record.handle[1] != size
+            # On ROCm the handle slot is a chunk list, not one CUDA handle.
+            or not isinstance(record.handle[3], int)
+        ):
             return None
-        # On ROCm the handle slot is a chunk list, not one CUDA handle.
-        if not isinstance(record.handle[3], int):
-            return None
-        return record
-
-    def swap_weight_allocation(self, address: int, size: int, handle: int) -> int | None:
-        import ctypes
-
-        from ... import local_gpu
-
-        record = self._weights_record(address)
-        if record is None or record.handle[1] != size:
-            return None
-        if record.is_asleep:
-            raise RuntimeError(f"weights allocation at 0x{address:x} is asleep")
-        device, _, _, p_handle = record.handle
-        slot = ctypes.c_uint64.from_address(p_handle)
-        own = slot.value
-        local_gpu.unmap(address, size)
-        try:
-            local_gpu.map_at(address, size, handle, device)
-        except BaseException:
-            try:
-                local_gpu.unmap(address, size)
-            except RuntimeError:
-                pass
-            local_gpu.map_at(address, size, own, device)
-            raise
+        slot = ctypes.c_uint64.from_address(record.handle[3])
+        previous = slot.value
         slot.value = handle
-        return own
-
-    def restore_weight_allocation(self, address: int, handle: int) -> None:
-        import ctypes
-
-        from ... import local_gpu
-
-        record = self._weights_record(address)
-        if record is None:
-            raise LookupError(f"no weights allocation at 0x{address:x}")
-        device, size, _, p_handle = record.handle
-        slot = ctypes.c_uint64.from_address(p_handle)
-        local_gpu.unmap(address, size)
-        local_gpu.release(slot.value)
-        local_gpu.map_at(address, size, handle, device)
-        slot.value = handle
+        return previous
 
     def all_gather_state(self, state) -> tuple[object, ...]:
         """Gather rank-local state through vLLM's CPU process group."""

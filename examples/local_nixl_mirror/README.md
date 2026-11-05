@@ -56,13 +56,21 @@ The strategy only runs when all of these are true:
 - the load is a reload;
 - the mirror answers from the same GPU UUID with a non-empty copy.
 
-For each mirror region, the strategy imports its FD and asks the engine
-adapter (`swap_weight_allocation(address, size, handle)`) to map it behind
-the engine's weights allocation of the same address and size, in place of
-the engine's own memory. The adapter returns None when the engine has no such
-allocation, and fails when the allocation is asleep (the engine did not wake
-the weights first). If no region matched, the engine is not a replica of the
-mirror's source and the strategy fails.
+For each mirror region whose address has engine memory mapped behind it,
+the strategy:
+
+1. imports the region's FD;
+2. asks the engine adapter to record it as the memory of its awake weights
+   allocation of the same address and size
+   (`replace_weight_handle(address, size, handle)`), so a later sleep or free
+   releases the mirror's memory like the engine's own;
+3. unmaps the engine's memory at that address, keeping it, and maps the
+   region there.
+
+The remapping is plain CUDA and lives in the strategy; the adapter does only
+the engine's bookkeeping, and returns None when the engine has no such
+allocation. If no region matched, the engine is not a replica of the mirror's
+source (or did not wake its weights) and the strategy fails.
 
 Everything not in place afterwards is finished by tensor name from the
 mirror's copy, which also checks that every tensor of the engine has its

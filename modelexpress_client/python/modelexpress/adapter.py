@@ -209,22 +209,15 @@ class EngineAdapter:
         return None
 
     @gated_capability
-    def swap_weight_allocation(self, address: int, size: int, handle: int) -> int | None:
-        """Put the cuMem allocation `handle` (imported by the caller) behind
-        the engine's weights allocation that starts at `address` and is `size`
-        bytes, in place of the engine's own memory, and make the engine own
-        it: a later sleep or free releases it like memory the engine created.
+    def replace_weight_handle(self, address: int, size: int, handle: int) -> int | None:
+        """Record the cuMem allocation `handle` as the memory of the engine's
+        awake weights allocation that starts at `address` and is `size` bytes,
+        so a later sleep or free of that allocation releases `handle`.
 
-        Returns the engine's own handle, unmapped but not released, for
-        restore_weight_allocation or for the caller to release once the swap
-        is final. Returns None, changing nothing, when the engine has no
-        weights allocation of that address and size. Raises, changing
-        nothing, when it has one but it is asleep (no memory behind it)."""
-
-    @gated_capability
-    def restore_weight_allocation(self, address: int, handle: int) -> None:
-        """Undo swap_weight_allocation at `address`: unmap and release the
-        swapped-in memory and map `handle`, the engine's own, back."""
+        Bookkeeping only: the caller maps the memory. Returns the handle the
+        engine held before, which the engine no longer releases. Returns None,
+        changing nothing, when the engine has no awake weights allocation of
+        that address and size."""
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""

@@ -167,6 +167,14 @@ def release(handle: int) -> None:
     _check("cuMemRelease", ctypes.c_uint64(handle))
 
 
+def retain_handle(va: int) -> int | None:
+    """A new reference to the cuMem allocation mapped at `va`, or None when
+    no cuMem allocation is mapped there. Release it like any handle."""
+    handle = ctypes.c_uint64()
+    rc = _cu().cuMemRetainAllocationHandle(ctypes.byref(handle), ctypes.c_void_p(va))
+    return handle.value if rc == 0 else None
+
+
 def reserve(size: int) -> int:
     va = ctypes.c_uint64()
     _check(
