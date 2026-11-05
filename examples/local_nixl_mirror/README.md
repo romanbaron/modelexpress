@@ -66,8 +66,7 @@ For each mirror region whose address has engine memory mapped behind it
 unmaps the engine's memory at that address (keeping it) and maps the region
 there. This is plain CUDA: it needs nothing from the engine adapter. A region
 whose size is not exactly that allocation's is skipped (`cuMemUnmap` only
-takes whole mappings). If no region matched, the engine is not a replica of
-the mirror's source (or did not wake its weights) and the strategy fails.
+takes whole mappings). The strategy succeeds even if no region matched.
 
 Only what the swap covers is reloaded. A weights allocation the mirror has
 no region of the same address and size for is left as the weights wake left

@@ -295,10 +295,6 @@ class LocalMirrorStrategy(LoadStrategy):
                 unmatched_regions=len(regions) - len(swapped),
                 swap_s=round(time.perf_counter() - t, 3),
             )
-            if not swapped:
-                # Not a replica of the mirror's source (no allocation at the
-                # source's addresses): another strategy loads faster.
-                raise RuntimeError("no mirror region matches a weights allocation")
         except Exception as e:
             for swap in reversed(swapped):
                 try:
