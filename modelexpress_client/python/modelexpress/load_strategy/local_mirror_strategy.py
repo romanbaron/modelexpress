@@ -410,9 +410,8 @@ class LocalMirrorStrategy(LoadStrategy):
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
-        path = self._socket(ctx)
         t0 = time.perf_counter()
-        stats: dict = {"socket": path}
+        stats: dict = {}
         swapped: list[_Swap] = []
         mapped_sizes: dict[int, int] = {}
         regions: dict = {}
@@ -470,10 +469,9 @@ class LocalMirrorStrategy(LoadStrategy):
                     _release_mirror(self._sock)
             except OSError as release_error:
                 logger.warning(
-                    f"[Worker {ctx.global_rank}] Releasing the mirror at {path} "
-                    f"failed: {release_error}"
+                    f"[Worker {ctx.global_rank}] Releasing the mirror failed: {release_error}"
                 )
-            raise StrategyFailed(f"local mirror at {path}: {e}", mutated=False) from e
+            raise StrategyFailed(f"local mirror: {e}", mutated=False) from e
         finally:
             for *_, fd in regions.values():
                 os.close(fd)
