@@ -310,35 +310,6 @@ class VllmAdapter(EngineAdapter):
 
         return bool(current_platform.is_cuda_alike())
 
-    def replace_weight_handle(self, address: int, size: int, handle: int) -> int | None:
-        # vLLM's CuMemAllocator (sleep mode) keeps one record per allocation,
-        # keyed by address, with handle = (device, size, address, p_handle).
-        # p_handle points at the malloc'd CUmemGenericAllocationHandle that
-        # unmap_and_release (sleep, free) releases and wake_up overwrites.
-        import ctypes
-
-        try:
-            from vllm.device_allocator.cumem import CuMemAllocator
-        except ImportError:
-            return None
-        allocator = CuMemAllocator.instance
-        if allocator is None:
-            return None
-        record = allocator.pointer_to_data.get(address)
-        if (
-            record is None
-            or record.tag != "weights"
-            or record.is_asleep
-            or record.handle[1] != size
-            # On ROCm the handle slot is a chunk list, not one CUDA handle.
-            or not isinstance(record.handle[3], int)
-        ):
-            return None
-        slot = ctypes.c_uint64.from_address(record.handle[3])
-        previous = slot.value
-        slot.value = handle
-        return previous
-
     def all_gather_state(self, state) -> tuple[object, ...]:
         """Gather rank-local state through vLLM's CPU process group."""
         from vllm.distributed import get_world_group

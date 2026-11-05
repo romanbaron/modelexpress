@@ -56,21 +56,13 @@ The strategy only runs when all of these are true:
 - the load is a reload;
 - the mirror answers from the same GPU UUID with a non-empty copy.
 
-For each mirror region whose address has engine memory mapped behind it,
-the strategy:
-
-1. imports the region's FD;
-2. asks the engine adapter to record it as the memory of its awake weights
-   allocation of the same address and size
-   (`replace_weight_handle(address, size, handle)`), so a later sleep or free
-   releases the mirror's memory like the engine's own;
-3. unmaps the engine's memory at that address, keeping it, and maps the
-   region there.
-
-The remapping is plain CUDA and lives in the strategy; the adapter does only
-the engine's bookkeeping, and returns None when the engine has no such
-allocation. If no region matched, the engine is not a replica of the mirror's
-source (or did not wake its weights) and the strategy fails.
+For each mirror region whose address has engine memory mapped behind it
+(`cuMemRetainAllocationHandle`), the strategy imports the region's FD,
+unmaps the engine's memory at that address (keeping it) and maps the region
+there. This is plain CUDA: it needs nothing from the engine adapter. A region
+whose size is not exactly that allocation's is skipped (`cuMemUnmap` only
+takes whole mappings). If no region matched, the engine is not a replica of
+the mirror's source (or did not wake its weights) and the strategy fails.
 
 Everything not in place afterwards is finished by tensor name from the
 mirror's copy, which also checks that every tensor of the engine has its
@@ -90,10 +82,15 @@ once everything succeeded. On failure, the strategy:
 
 ## vLLM requirements
 
-- Sleep mode must be on (`CuMemAllocator`). The strategy reads its records
-  (`pointer_to_data`, the `(device, size, address, p_handle)` handle) and
-  rewrites the handle slot, so a later sleep or free releases the mirror's
-  memory like the engine's own.
+- Sleep mode must be on (`CuMemAllocator`): the weights must be cuMem
+  allocations.
+- Known limitation: the engine's allocator is not told about the swap. Its
+  record of each swapped allocation keeps the handle of the engine's own
+  memory, which the strategy releases. Serving is unaffected, but the
+  engine's next sleep or free of a swapped allocation releases that stale
+  handle: `CuMemAllocator.sleep` raises and leaves the allocation unmapped
+  but marked awake. Teaching the allocator the new handle (rewriting the
+  record's handle slot) removes this.
 - The reload follows vLLM's usual order after a level-2 sleep:
   `wake_up(tags=["weights"])`, then `reload_weights`, then
   `wake_up(tags=["kv_cache"])`. The weights wake restores the buffers saved at

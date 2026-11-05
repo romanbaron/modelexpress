@@ -18,6 +18,14 @@ sleep), then reload_weights. The engine's own memory is unmapped, not
 released, until every swap succeeded, so a failure maps it back unchanged;
 on success it is released.
 
+The swap is plain CUDA and needs nothing from the engine: the engine's
+memory at an address comes from cuMemRetainAllocationHandle, and the
+mirror's is mapped in its place. The engine's allocator is not told, so it
+still records the handle of the memory that was released. Until the
+engine's next sleep or free of a swapped allocation nothing reads that
+record; that sleep or free then releases a handle that is gone (in vLLM,
+CuMemAllocator.sleep raises).
+
 What does not match -- an allocation the mirror has no region for, or a
 region the source recreated elsewhere -- is finished by tensor name from the
 mirror's copy (local_mirror.finish_by_name).
@@ -42,7 +50,7 @@ import time
 from typing import NamedTuple
 
 from .. import envs, local_gpu
-from ..adapter import EngineAdapter, StrategyFailed
+from ..adapter import StrategyFailed
 from .base import LoadContext, LoadStrategy, _as_load_result
 from .context import LoadResult
 
@@ -62,8 +70,6 @@ class LocalMirrorStrategy(LoadStrategy):
     """Swap a local mirror's copy in behind the engine's weights."""
 
     name = "local_mirror"
-    requires = (EngineAdapter.replace_weight_handle,)
-
     # The weights arrive processed, at their own addresses: no layerwise
     # reload to enter or leave, no post-processing, and no registration --
     # the mirror's NIXL agent already serves this memory.
@@ -171,11 +177,13 @@ class LocalMirrorStrategy(LoadStrategy):
             for *_, fd in regions.values():
                 os.close(fd)
 
-        # The swap is final: free the engine's own copy (its original
-        # reference and the one _swap_in retained). The mirror's handle now
-        # belongs to the engine, which releases it on its next sleep or free.
+        # The swap is final: free the engine's own memory. retain_handle gave
+        # back the very handle the engine created it with, so releasing it
+        # twice drops both the engine's reference and the retained one. The
+        # engine's allocator still records that handle (see the module
+        # docstring).
         for swap in swapped:
-            local_gpu.release(swap.previous)
+            local_gpu.release(swap.own)
             local_gpu.release(swap.own)
         stats["total_s"] = round(time.perf_counter() - t0, 3)
         logger.info(f"[Worker {ctx.global_rank}] [TIMING] local_mirror: {stats}")
@@ -188,61 +196,52 @@ class LocalMirrorStrategy(LoadStrategy):
 class _Swap(NamedTuple):
     address: int
     size: int
-    own: int  # a retained reference to the engine's memory, unmapped
-    previous: int  # the handle the engine held for it
-    mirror: int  # the mirror's memory, now mapped and held by the engine
-
-
-def _remap(address: int, size: int, old: int, new: int, device: int) -> None:
-    """Put `new` behind address..address+size in place of `old`; on failure
-    `old` is mapped back."""
-    local_gpu.unmap(address, size)
-    try:
-        local_gpu.map_at(address, size, new, device)
-    except BaseException:
-        try:
-            local_gpu.unmap(address, size)
-        except RuntimeError:
-            pass
-        local_gpu.map_at(address, size, old, device)
-        raise
+    own: int  # the engine's memory, unmapped, retained for a rollback
 
 
 def _swap_in(ctx: LoadContext, address: int, size: int, fd: int) -> _Swap | None:
-    """Map the mirror region `fd` behind the engine's awake weights
-    allocation at address/size and make the engine hold it. None, changing
-    nothing, when the engine has no such allocation."""
+    """Map the mirror region `fd` behind the engine's memory mapped at
+    address..address+size, in place of it. None, changing nothing, when the
+    engine has no allocation mapped exactly there."""
     # The engine's memory at this address; None when nothing is mapped there
     # (no allocation, or one that is asleep).
     own = local_gpu.retain_handle(address)
     if own is None:
         return None
-    mirror = None
     try:
         mirror = local_gpu.import_fd(fd)
-        previous = ctx.adapter.replace_weight_handle(address, size, mirror)
-        if previous is not None:
-            try:
-                _remap(address, size, own, mirror, ctx.device_id)
-            except BaseException:
-                ctx.adapter.replace_weight_handle(address, size, previous)
-                raise
-            return _Swap(address, size, own, previous, mirror)
     except BaseException:
-        if mirror is not None:
-            local_gpu.release(mirror)
         local_gpu.release(own)
         raise
+    try:
+        # cuMemUnmap only takes whole mappings: a failure means the engine's
+        # allocation there is not exactly this region, and nothing changed.
+        local_gpu.unmap(address, size)
+    except RuntimeError:
+        local_gpu.release(mirror)
+        local_gpu.release(own)
+        return None
+    try:
+        local_gpu.map_at(address, size, mirror, ctx.device_id)
+    except BaseException:
+        try:
+            local_gpu.unmap(address, size)
+        except RuntimeError:
+            pass
+        local_gpu.map_at(address, size, own, ctx.device_id)
+        local_gpu.release(mirror)
+        local_gpu.release(own)
+        raise
+    # The mapping keeps the mirror's memory alive; the engine's next unmap
+    # of this address (sleep, free) drops it.
     local_gpu.release(mirror)
-    local_gpu.release(own)
-    return None
+    return _Swap(address, size, own)
 
 
 def _swap_back(ctx: LoadContext, swap: _Swap) -> None:
-    """Undo _swap_in: the engine's own memory and handle are back."""
-    _remap(swap.address, swap.size, swap.mirror, swap.own, ctx.device_id)
-    ctx.adapter.replace_weight_handle(swap.address, swap.size, swap.previous)
-    local_gpu.release(swap.mirror)
+    """Undo _swap_in: the engine's own memory is mapped back, unchanged."""
+    local_gpu.unmap(swap.address, swap.size)
+    local_gpu.map_at(swap.address, swap.size, swap.own, ctx.device_id)
     local_gpu.release(swap.own)
 
 

@@ -208,17 +208,6 @@ class EngineAdapter:
         """
         return None
 
-    @gated_capability
-    def replace_weight_handle(self, address: int, size: int, handle: int) -> int | None:
-        """Record the cuMem allocation `handle` as the memory of the engine's
-        awake weights allocation that starts at `address` and is `size` bytes,
-        so a later sleep or free of that allocation releases `handle`.
-
-        Bookkeeping only: the caller maps the memory. Returns the handle the
-        engine held before, which the engine no longer releases. Returns None,
-        changing nothing, when the engine has no awake weights allocation of
-        that address and size."""
-
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""
         return result
