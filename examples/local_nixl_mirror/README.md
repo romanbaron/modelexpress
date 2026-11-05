@@ -57,7 +57,7 @@ ordinal.
 The strategy only runs when all of these are true:
 
 - the load is a reload;
-- the mirror answers and holds a non-empty copy.
+- the mirror answers on its socket.
 
 For each mirror region whose address has engine memory mapped behind it
 (`cuMemRetainAllocationHandle`), the strategy imports the region's FD,

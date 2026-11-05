@@ -411,12 +411,9 @@ class LocalMirrorStrategy(LoadStrategy):
             return False
         path = self._socket(ctx)
         try:
-            msg = _query(path)
+            _query(path)
         except OSError as e:
             logger.info(f"[Worker {ctx.global_rank}] No local mirror at {path} ({e}), skipped")
-            return False
-        if not msg.get("memory_bytes"):
-            logger.info(f"[Worker {ctx.global_rank}] Local mirror at {path} holds nothing, skipped")
             return False
         return True
 
