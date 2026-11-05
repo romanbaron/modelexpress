@@ -190,14 +190,26 @@ def _recv_msg(sock: socket.socket, maxfds: int = 0) -> tuple[dict, list[int]]:
 # --- Mirror client -------------------------------------------------------------
 
 
-def _receive_regions(path: str):
+def _connect(path: str) -> socket.socket:
+    """A connection to the mirror at `path`; raises OSError when there is
+    none. The mirror opens its socket only once its copy is complete, and
+    answers any number of requests on one connection."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        sock.settimeout(10)
+        sock.connect(path)
+        sock.settimeout(60)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def _receive_regions(sock: socket.socket):
     """The mirror's regions as {source_addr: (size, allocation_size, fd)},
     plus its header."""
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    sock.settimeout(60)
     regions: dict[int, tuple[int, int, int]] = {}
     try:
-        sock.connect(path)
         _send_msg(sock, {"want": "regions"})
         while True:
             msg, fds = _recv_msg(sock, _MAX_FDS_PER_MSG)
@@ -213,8 +225,6 @@ def _receive_regions(path: str):
         for *_, fd in regions.values():
             os.close(fd)
         raise
-    finally:
-        sock.close()
     return msg, regions
 
 
@@ -242,15 +252,12 @@ def _source_manifest(ctx, source_agent: str) -> dict:
     raise LookupError(f"no READY source with agent {source_agent} for this model and rank")
 
 
-def _release_mirror(path: str) -> None:
+def _release_mirror(sock: socket.socket) -> None:
     """Ask the mirror to free its copy (it keeps running, holding nothing).
     For a reload that cannot use the copy: the memory is needed for the
     engine's own weights."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as sock:
-        sock.settimeout(60)
-        sock.connect(path)
-        _send_msg(sock, {"want": "release"})
-        _recv_msg(sock)
+    _send_msg(sock, {"want": "release"})
+    _recv_msg(sock)
 
 
 def _finish_by_name(
@@ -362,18 +369,13 @@ def _finish_by_name(
 # --- Strategy ------------------------------------------------------------------
 
 
-def _check_connection(path: str) -> None:
-    """Raise OSError unless a mirror accepts connections at `path`. The
-    mirror opens its socket only once its copy is complete."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as sock:
-        sock.settimeout(10)
-        sock.connect(path)
-
-
 class LocalMirrorStrategy(LoadStrategy):
     """Swap a local mirror's copy in behind the engine's weights."""
 
     name = "local_mirror"
+    # The connection to the mirror, opened by is_available and used and
+    # closed by load.
+    _sock: socket.socket | None = None
     # The weights arrive processed, at their own addresses: no layerwise
     # reload to enter or leave, no post-processing, and no registration --
     # the mirror's NIXL agent already serves this memory.
@@ -396,12 +398,18 @@ class LocalMirrorStrategy(LoadStrategy):
         if not super().is_available(ctx):
             return False
         path = self._socket(ctx)
+        self._disconnect()
         try:
-            _check_connection(path)
+            self._sock = _connect(path)
         except OSError as e:
             logger.info(f"[Worker {ctx.global_rank}] No local mirror at {path} ({e}), skipped")
             return False
         return True
+
+    def _disconnect(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
@@ -412,7 +420,9 @@ class LocalMirrorStrategy(LoadStrategy):
         mapped_sizes: dict[int, int] = {}
         regions: dict = {}
         try:
-            header, regions = _receive_regions(path)
+            if self._sock is None:
+                self._sock = _connect(path)
+            header, regions = _receive_regions(self._sock)
             stats["receive_s"] = round(time.perf_counter() - t0, 3)
 
             t = time.perf_counter()
@@ -459,7 +469,8 @@ class LocalMirrorStrategy(LoadStrategy):
                         f"failed: {undo}"
                     )
             try:
-                _release_mirror(path)
+                if self._sock is not None:
+                    _release_mirror(self._sock)
             except OSError as release_error:
                 logger.warning(
                     f"[Worker {ctx.global_rank}] Releasing the mirror at {path} "
@@ -469,6 +480,7 @@ class LocalMirrorStrategy(LoadStrategy):
         finally:
             for *_, fd in regions.values():
                 os.close(fd)
+            self._disconnect()
 
         # The swap is final: free the engine's own memory. retain_handle gave
         # back the very handle the engine created it with, so releasing it

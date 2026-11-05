@@ -413,37 +413,39 @@ def serve_local(path, source_agent, source_endpoint, regions, release):
     log(f"handing out {len(regions)} regions on {path}")
     while True:
         conn, _ = server.accept()
+        # One client at a time; it sends any number of requests on its
+        # connection and closes it when done.
         try:
             with conn:
-                try:
-                    request, _ = recv_msg(conn)
-                except ConnectionError:
-                    # A connection check: closed before sending a request.
-                    continue
-                if request.get("want") == "memory":
-                    send_msg(conn, {"memory_bytes": memory_bytes})
-                    continue
-                if request.get("want") == "release":
-                    released = memory_bytes
-                    if regions:
-                        for fd in fds:
-                            os.close(fd)
-                        release()
-                        regions, fds, memory_bytes = [], [], 0
-                        log(f"released the copy ({released / 2**30:.2f} GiB) on request")
-                    send_msg(conn, {"released": released})
-                    continue
-                if not regions:
-                    send_msg(conn, {"error": "the copy was released"})
-                    continue
-                for i in range(0, len(regions), step):
-                    send_msg(conn, {
-                        "source_agent": source_agent,
-                        "source_endpoint": source_endpoint,
-                        "batch": [[a, s, aligned(s)] for a, s, _ in regions[i:i + step]],
-                        "last": i + step >= len(regions),
-                    }, fds[i:i + step])
-            log(f"handed out {len(regions)} regions")
+                while True:
+                    try:
+                        request, _ = recv_msg(conn)
+                    except ConnectionError:
+                        break  # the client closed the connection
+                    if request.get("want") == "memory":
+                        send_msg(conn, {"memory_bytes": memory_bytes})
+                        continue
+                    if request.get("want") == "release":
+                        released = memory_bytes
+                        if regions:
+                            for fd in fds:
+                                os.close(fd)
+                            release()
+                            regions, fds, memory_bytes = [], [], 0
+                            log(f"released the copy ({released / 2**30:.2f} GiB) on request")
+                        send_msg(conn, {"released": released})
+                        continue
+                    if not regions:
+                        send_msg(conn, {"error": "the copy was released"})
+                        continue
+                    for i in range(0, len(regions), step):
+                        send_msg(conn, {
+                            "source_agent": source_agent,
+                            "source_endpoint": source_endpoint,
+                            "batch": [[a, s, aligned(s)] for a, s, _ in regions[i:i + step]],
+                            "last": i + step >= len(regions),
+                        }, fds[i:i + step])
+                    log(f"handed out {len(regions)} regions")
         except OSError as e:
             log(f"local client failed: {e}")
 
