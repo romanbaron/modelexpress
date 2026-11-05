@@ -69,13 +69,9 @@ whose size is not exactly that allocation's is skipped (`cuMemUnmap` only
 takes whole mappings). If no region matched, the engine is not a replica of
 the mirror's source (or did not wake its weights) and the strategy fails.
 
-Everything not in place afterwards is finished by tensor name from the
-mirror's copy, which also checks that every tensor of the engine has its
-source counterpart:
-
-- tensors in allocations without a matching region keep their own memory and
-  are written;
-- tensors in regions without a matching allocation are copied by name.
+Only what the swap covers is reloaded. A weights allocation the mirror has
+no region of the same address and size for is left as the weights wake left
+it; the strategy does not detect or fill it.
 
 The engine's own memory is only unmapped during the swap. It is released
 once everything succeeded. On failure, the strategy:
